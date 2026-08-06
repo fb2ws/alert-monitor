@@ -4,9 +4,11 @@ on:
   schedule:
     # Runs every 30 minutes
     - cron: '*/30 * * * *'
-  workflow_dispatch: # Allows manual triggering
-  push: # Add this line
-    branches: [ "main" ] # Add this line
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
 
 jobs:
   monitor:
@@ -21,10 +23,11 @@ jobs:
       with:
         python-version: '3.11'
         
-    - name: Install dependencies
+    - name: Install dependencies & Playwright browsers
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
+        playwright install chromium
         
     - name: Restore state file cache
       uses: actions/cache/restore@v4
@@ -34,6 +37,7 @@ jobs:
         restore-keys: |
           state-
           
+    # The actual script execution
     - name: Run monitoring script
       env:
         CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}

@@ -12,20 +12,15 @@ jobs:
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v4.2.2 # Updated to latest stable
       
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v5.3.0 # Updated to latest stable
       with:
         python-version: '3.11'
         
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        
     - name: Restore state file cache
-      uses: actions/cache@v3
+      uses: actions/cache/restore@v4 # Updated from v3 to v4
       with:
         path: state.json
         key: state-${{ github.run_id }}
@@ -36,13 +31,14 @@ jobs:
       env:
         CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
         CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
+        FB_PAGE_1: ${{ secrets.FB_PAGE_1 }}
         FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
         FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}
         STOP_ALERTS: ${{ vars.STOP_ALERTS }}
       run: python main.py
       
     - name: Save state file cache
-      uses: actions/cache/save@v3
+      uses: actions/cache/save@v4 # Updated from v3 to v4
       if: always()
       with:
         path: state.json

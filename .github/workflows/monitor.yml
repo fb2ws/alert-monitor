@@ -5,6 +5,8 @@ on:
     # Runs every 30 minutes
     - cron: '*/30 * * * *'
   workflow_dispatch: # Allows manual triggering
+  push: # Add this line
+    branches: [ "main" ] # Add this line
 
 jobs:
   monitor:

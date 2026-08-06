@@ -12,7 +12,7 @@ PHONE_NUMBER = os.environ.get("CALLMEBOT_PHONE")
 API_KEY = os.environ.get("CALLMEBOT_API_KEY")
 
 # Target URLs
-LEVIS_URL = "https://www.levi.com/US/en_US/"
+LEVIS_URL = "https://www.levi.com/US/en_US/search/polo/facets/feature-gender/men/sort/price-asc"
 FACEBOOK_PAGES = [
     "https://www.facebook.com/hahaphone.hk",
     os.environ.get("FB_PAGE_2", "https://www.facebook.com/meta"), # Replace with actual page 2

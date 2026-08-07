@@ -7,175 +7,90 @@ from playwright.sync_api import sync_playwright
 # --- Configuration ---
 PHONE_NUMBER = os.environ.get("CALLMEBOT_PHONE")
 API_KEY = os.environ.get("CALLMEBOT_API_KEY")
-
-LEVIS_URL = "https://www.levi.com/US/en_US/search/polo/facets/feature-gender/men/sort/price-asc" 
-# We fetch all 3 Facebook pages from your GitHub Secrets for privacy
-FACEBOOK_PAGES = [
-    os.environ.get("FB_PAGE_1" ),
-    os.environ.get("FB_PAGE_2"),
-    os.environ.get("FB_PAGE_3")
-]
-FACEBOOK_PAGES = [url for url in FACEBOOK_PAGES if url] # Remove empty ones
-
+FACEBOOK_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4)]
+FACEBOOK_PAGES = [url for url in FACEBOOK_PAGES if url]
 STATE_FILE = "state.json"
 
 def send_whatsapp_alert(message):
-    """Sends a WhatsApp message using CallMeBot API."""
-    if not PHONE_NUMBER or not API_KEY:
-        print("CallMeBot credentials not set. Skipping alert.")
-        return False
-        
+    if not (PHONE_NUMBER and API_KEY): return
     url = f"https://api.callmebot.com/whatsapp.php?phone={PHONE_NUMBER}&text={requests.utils.quote(message )}&apikey={API_KEY}"
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code == 200:
-            print(f"Alert sent successfully: {message[:30]}...")
-            return True
-        else:
-            print(f"Failed to send alert. Status code: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"Error sending alert: {e}")
-        return False
+    requests.get(url, timeout=15)
 
 def load_state():
-    """Loads the previous state to avoid duplicate alerts."""
     if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {"levis_sale_seen": False, "fb_posts": {}}
+        try: return json.load(open(STATE_FILE, "r"))
+        except: pass
     return {"levis_sale_seen": False, "fb_posts": {}}
 
-def save_state(state):
-    """Saves the current state."""
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-def check_levis_with_playwright(state):
-    """Checks Levi's using headless browser to bypass Akamai/Cloudflare anti-bot."""
-    print("Checking Levi's US for 50% off sale...")
-    found_sale = False
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US"
-        )
-        # Stealth: hide the fact that this is a robot
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+def check_facebook_page(page, url, state):
+    print(f"Checking FB: {url}")
+    try:
+        page.goto(url, timeout=60000, wait_until="networkidle")
+        time.sleep(5)
         
-        page = context.new_page()
+        # 1. Close the annoying login popup if it appears
         try:
-            page.goto(LEVIS_URL, timeout=45000, wait_until="domcontentloaded")
-            time.sleep(3) # Wait for page scripts to run
-            
-            content = page.content().lower()
-            sale_keywords = ["50% off", "half off", "50 percent off", "save 50%"]
-            found_sale = any(kw in content for kw in sale_keywords)
-            
-            print(f"Levi's check completed. 50% off detected: {found_sale}")
-        except Exception as e:
-            print(f"Error browsing Levi's: {e}")
-        finally:
-            browser.close()
-            
-    # Alert logic
-    if found_sale and not state.get("levis_sale_seen"):
-        alert_msg = "🚨 *LEVI'S SALE ALERT* 🚨\n\n50% OFF detected on Levi's US website!\nCheck it out now: https://www.levi.com/US/en_US/"
-        if send_whatsapp_alert(alert_msg ):
-            state["levis_sale_seen"] = True
-    elif not found_sale:
-        state["levis_sale_seen"] = False
-        
-    return state
+            close_btn = page.locator("div[role='button'][aria-label='Close'], div[aria-label='關閉']").first
+            if close_btn.is_visible(): close_btn.click()
+        except: pass
 
-def check_facebook_with_playwright(url, state):
-    """Checks Facebook page for new posts using headless browser."""
-    print(f"Checking Facebook page: {url}...")
-    latest_content = ""
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US"
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # 2. Target the first post specifically
+        # We look for the first text block inside a post container
+        post_text = ""
+        # Selector for the actual message text in FB posts
+        selectors = ["div[data-ad-comet-preview='message']", "div[dir='auto']", "div[role='article']"]
         
-        page = context.new_page()
-        try:
-            page.goto(url, timeout=45000, wait_until="domcontentloaded")
-            time.sleep(5) # Allow FB public view to render
-            
-            # Extract meta description or visible text to detect changes
-            meta_desc = page.locator("meta[name='description']").get_attribute("content")
-            if meta_desc:
-                latest_content = meta_desc
-            else:
-                latest_content = page.inner_text("body")[:2000]
-                
-            print(f"Successfully scraped {url}.")
-        except Exception as e:
-            print(f"Error scraping Facebook {url}: {e}")
-        finally:
-            browser.close()
-            
-    if not latest_content:
-        return state
+        for sel in selectors:
+            element = page.locator(sel).first
+            if element.is_visible():
+                post_text = element.inner_text().strip()
+                if post_text: break
         
-    if "fb_posts" not in state:
-        state["fb_posts"] = {}
+        if not post_text:
+            print("Could not find post text, falling back to page title.")
+            post_text = page.title()
+
+        # Compare only the first 50 characters to detect a "new" post
+        new_fingerprint = post_text[:50]
         
-    previous_content = state["fb_posts"].get(url)
-    
-    if previous_content != latest_content and previous_content is not None:
-        alert_msg = f"📱 *NEW FACEBOOK POST* 📱\n\nNew activity detected on page:\n{url}"
-        send_whatsapp_alert(alert_msg)
+        if "fb_posts" not in state: state["fb_posts"] = {}
+        old_fingerprint = state["fb_posts"].get(url)
         
-    state["fb_posts"][url] = latest_content
+        if old_fingerprint and old_fingerprint != new_fingerprint:
+            send_whatsapp_alert(f"📱 *NEW FB POST* 📱\n\nPage: {url}\n\nContent: {post_text[:100]}...")
+            print("New post detected!")
+        
+        state["fb_posts"][url] = new_fingerprint
+    except Exception as e:
+        print(f"FB Error: {e}")
     return state
 
 def main():
-    print("Starting robust Playwright monitoring script...")
-    
-    if os.environ.get("STOP_ALERTS", "false").lower() == "true":
-        print("Stop flag is active. Exiting.")
-        return
-
+    if os.environ.get("STOP_ALERTS", "false").lower() == "true": return
     state = load_state()
     
-    # 1. Check Levi's
-    state = check_levis_with_playwright(state)
-    time.sleep(5)
-    
-    # 2. Check Facebook Pages
-    for url in FACEBOOK_PAGES:
-        state = check_facebook_with_playwright(url, state)
-        time.sleep(5)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = context.new_page()
         
-    save_state(state)
-    print("Monitoring cycle complete.")
+        # 1. Check Levi's
+        try:
+            page.goto("https://www.levi.com/US/en_US/", timeout=60000 )
+            content = page.content().lower()
+            found_sale = any(kw in content for kw in ["50% off", "half off", "save 50%"])
+            if found_sale and not state.get("levis_sale_seen"):
+                send_whatsapp_alert("🚨 *LEVI'S 50% OFF ALERT* 🚨\nCheck: https://www.levi.com/US/en_US/" )
+                state["levis_sale_seen"] = True
+            elif not found_sale: state["levis_sale_seen"] = False
+        except: pass
 
-if __name__ == "__main__":
-    main()
+        # 2. Check FB Pages
+        for url in FACEBOOK_PAGES:
+            state = check_facebook_page(page, url, state)
+            
+        browser.close()
+    
+    json.dump(state, open(STATE_FILE, "w"))
+
+if __name__ == "__main__": main()

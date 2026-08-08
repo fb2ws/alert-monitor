@@ -5,18 +5,10 @@ import random
 import requests
 from playwright.sync_api import sync_playwright
 
-# Safety import for Stealth Library
-try:
-    from fake_useragent import UserAgent
-    ua_generator = UserAgent()
-except:
-    ua_generator = None
-
 # --- Configuration ---
 PHONE_NUMBER = os.environ.get("CALLMEBOT_PHONE")
 API_KEY = os.environ.get("CALLMEBOT_API_KEY")
 FACEBOOK_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_{i}")]
-
 LEVIS_URL = "https://www.levi.com/US/en_US/search/polo/facets/feature-gender/men/sort/price-asc"
 OWNDAYS_URL = "https://www.owndays.com/jp/en/products/SENICHI31?sku=6259"
 STATE_FILE = "state.json"
@@ -37,16 +29,14 @@ def check_owndays(page, state):
     try:
         page.goto(OWNDAYS_URL, timeout=60000)
         time.sleep(5)
-        body_text = page.inner_text("body").lower()
-        is_in_stock = "out of stock online" not in body_text
+        is_in_stock = "out of stock online" not in page.inner_text("body").lower()
         o = state.get("owndays", {"in_stock": False, "count": 0})
         if is_in_stock:
             if not o["in_stock"] or o["count"] < 5:
                 o["count"] += 1
-                send_whatsapp_alert(f"🟢 *OWNDAYS STOCK ({o['count']}/5)* 🟢\nItem is IN STOCK!\n{OWNDAYS_URL}")
+                send_whatsapp_alert(f"🟢 *OWNDAYS STOCK ({o['count']}/5)* 🟢\nIN STOCK!\n{OWNDAYS_URL}")
             o["in_stock"] = True
-        else:
-            o["in_stock"], o["count"] = False, 0
+        else: o["in_stock"], o["count"] = False, 0
         state["owndays"] = o
     except: pass
     return state
@@ -64,58 +54,56 @@ def check_levis(page, state):
                 l["count"] += 1
                 send_whatsapp_alert(f"🚨 *LEVI'S SALE ({l['count']}/5)* 🚨\nFound: *{sale.upper()}*\n{LEVIS_URL}")
             l["sale"] = sale
-        else:
-            l["sale"], l["count"] = "", 0
+        else: l["sale"], l["count"] = "", 0
         state["levis"] = l
     except: pass
     return state
 
 def check_facebook(page, url, state):
+    # Convert standard URL to M-Basic URL for extreme stability
+    m_url = url.replace("www.facebook.com", "mbasic.facebook.com")
+    print(f"Checking FB (M-Basic): {m_url}")
+    
     try:
-        page.goto(url, timeout=60000, wait_until="networkidle")
-        time.sleep(8)
+        page.goto(m_url, timeout=60000)
+        time.sleep(random.uniform(5, 8))
         
-        # Target post content
-        post_text = ""
-        for sel in ["div[data-ad-comet-preview='message']", "div[dir='auto']", "div[role='article']"]:
-            elements = page.locator(sel).all()
-            for el in elements:
-                if el.is_visible():
-                    text = el.inner_text().strip()
-                    # Filter out short strings or language selectors
-                    if len(text) > 20 and "english" not in text.lower():
-                        post_text = text
-                        break
-            if post_text: break
-            
-        if not post_text: post_text = page.title()
+        # M-Basic specific logic: Look for the first 'article' or 'story'
+        # We extract all text and look for the first significant block
+        full_text = page.inner_text("body")
         
-        # --- Advanced Anti-Bot / Wall Detection ---
-        # We block common "Consent" and "Login" wall phrases
-        wall_keywords = [
-            "facebook", "log in", "sign up", "see more from", 
-            "english (us)", "english (uk)", "cookie policy", "privacy policy",
-            "create new account", "forgotten account"
-        ]
-        
-        if any(kw in post_text.lower() for kw in wall_keywords):
-            print(f"⚠️ FB Wall/Consent detected for {url}. Skipping.")
+        # --- THE NUCLEAR FILTER ---
+        # If the page contains these words, it is 100% a login wall.
+        blacklist = ["mobile number", "email", "password", "log in", "forgot password", "create account", "sign up"]
+        if any(word in full_text.lower() for word in blacklist):
+            print(f"⚠️ LOGIN WALL DETECTED for {url}. Aborting to prevent false alert.")
             return state
 
-        # We use a 20-character snippet for more stable comparison
-        new_snippet = post_text[:20]
+        # Find the first real post text (M-Basic posts are usually in <div> or <p> tags)
+        # We skip the header/intro by looking for text after the 'Intro' or 'About' section
+        lines = [line.strip() for line in full_text.split('\n') if len(line.strip()) > 20]
+        post_text = ""
+        for line in lines:
+            # Skip common header text
+            if any(x in line.lower() for x in ["followers", "following", "likes", "intro", "about", "photos"]):
+                continue
+            post_text = line
+            break
+
+        if not post_text: post_text = page.title()
+
+        new_snippet = post_text[:15] # 15 chars for better uniqueness
         if "fb" not in state: state["fb"] = {}
         
         old_snippet = state["fb"].get(url)
+        # Only alert if we have an old state AND it's actually different
         if old_snippet and old_snippet != new_snippet:
-            # 150-character preview as requested
             preview = post_text[:150].replace('\n', ' ')
             send_whatsapp_alert(f"📱 *NEW FB POST* 📱\nPage: {url}\n\nPreview: {preview}...")
-            print(f"Alert sent for {url}")
-            
+            print(f"✅ Real Alert Sent for {url}")
+        
         state["fb"][url] = new_snippet
-    except Exception as e:
-        print(f"FB Error: {e}")
+    except Exception as e: print(f"FB Error: {e}")
     return state
 
 def main():
@@ -123,22 +111,18 @@ def main():
     time.sleep(random.uniform(5, 15))
     state = load_state()
     
-    my_ua = ua_generator.random if ua_generator else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"])
-        context = browser.new_context(user_agent=my_ua, viewport={"width": 1920, "height": 1080})
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        # Use a mobile-like user agent for M-Basic consistency
+        context = browser.new_context(user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1")
         page = context.new_page()
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         state = check_owndays(page, state)
         state = check_levis(page, state)
-        for url in FACEBOOK_PAGES:
-            state = check_facebook(page, url, state)
-            
+        for url in FACEBOOK_PAGES: state = check_facebook(page, url, state)
         browser.close()
     
     json.dump(state, open(STATE_FILE, "w"))
-    print("Done.")
+    print("Stealth cycle complete.")
 
 if __name__ == "__main__": main()

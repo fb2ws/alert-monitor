@@ -37,12 +37,13 @@ def check_owndays(page, state):
     try:
         page.goto(OWNDAYS_URL, timeout=60000)
         time.sleep(5)
-        is_in_stock = "out of stock online" not in page.inner_text("body").lower()
+        body_text = page.inner_text("body").lower()
+        is_in_stock = "out of stock online" not in body_text
         o = state.get("owndays", {"in_stock": False, "count": 0})
         if is_in_stock:
             if not o["in_stock"] or o["count"] < 5:
                 o["count"] += 1
-                send_whatsapp_alert(f"🟢 *OWNDAYS STOCK ({o['count']}/5)* 🟢\nSENICHI31 is IN STOCK!\n{OWNDAYS_URL}")
+                send_whatsapp_alert(f"🟢 *OWNDAYS STOCK ({o['count']}/5)* 🟢\nItem is IN STOCK!\n{OWNDAYS_URL}")
             o["in_stock"] = True
         else:
             o["in_stock"], o["count"] = False, 0
@@ -73,28 +74,48 @@ def check_facebook(page, url, state):
     try:
         page.goto(url, timeout=60000, wait_until="networkidle")
         time.sleep(8)
+        
+        # Target post content
         post_text = ""
         for sel in ["div[data-ad-comet-preview='message']", "div[dir='auto']", "div[role='article']"]:
-            el = page.locator(sel).first
-            if el.is_visible():
-                text = el.inner_text().strip()
-                if len(text) > 5:
-                    post_text = text
-                    break
+            elements = page.locator(sel).all()
+            for el in elements:
+                if el.is_visible():
+                    text = el.inner_text().strip()
+                    # Filter out short strings or language selectors
+                    if len(text) > 20 and "english" not in text.lower():
+                        post_text = text
+                        break
+            if post_text: break
+            
         if not post_text: post_text = page.title()
         
-        # Anti-Bot Wall Filter
-        if any(kw in post_text.lower() for kw in ["facebook", "log in", "sign up", "see more from"]):
-            print(f"⚠️ Wall detected for {url}. Skipping.")
+        # --- Advanced Anti-Bot / Wall Detection ---
+        # We block common "Consent" and "Login" wall phrases
+        wall_keywords = [
+            "facebook", "log in", "sign up", "see more from", 
+            "english (us)", "english (uk)", "cookie policy", "privacy policy",
+            "create new account", "forgotten account"
+        ]
+        
+        if any(kw in post_text.lower() for kw in wall_keywords):
+            print(f"⚠️ FB Wall/Consent detected for {url}. Skipping.")
             return state
 
-        new_snippet = post_text[:10]
+        # We use a 20-character snippet for more stable comparison
+        new_snippet = post_text[:20]
         if "fb" not in state: state["fb"] = {}
-        if state["fb"].get(url) and state["fb"].get(url) != new_snippet:
+        
+        old_snippet = state["fb"].get(url)
+        if old_snippet and old_snippet != new_snippet:
+            # 150-character preview as requested
             preview = post_text[:150].replace('\n', ' ')
             send_whatsapp_alert(f"📱 *NEW FB POST* 📱\nPage: {url}\n\nPreview: {preview}...")
+            print(f"Alert sent for {url}")
+            
         state["fb"][url] = new_snippet
-    except: pass
+    except Exception as e:
+        print(f"FB Error: {e}")
     return state
 
 def main():
@@ -102,7 +123,6 @@ def main():
     time.sleep(random.uniform(5, 15))
     state = load_state()
     
-    # Choose identity: Random or Fallback
     my_ua = ua_generator.random if ua_generator else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     
     with sync_playwright() as p:
@@ -113,7 +133,9 @@ def main():
         
         state = check_owndays(page, state)
         state = check_levis(page, state)
-        for url in FACEBOOK_PAGES: state = check_facebook(page, url, state)
+        for url in FACEBOOK_PAGES:
+            state = check_facebook(page, url, state)
+            
         browser.close()
     
     json.dump(state, open(STATE_FILE, "w"))

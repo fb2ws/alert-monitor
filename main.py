@@ -12,9 +12,9 @@ from bs4 import BeautifulSoup
 PHONE_NUMBER = os.environ.get("CALLMEBOT_PHONE")
 API_KEY = os.environ.get("CALLMEBOT_API_KEY")
 
-# Read individual page secrets (FB_PAGE_1, FB_PAGE_2, FB_PAGE_3)
+# Read individual page secrets
 FB_PAGES = []
-for i in range(1, 10):  # Check FB_PAGE_1 through FB_PAGE_9
+for i in range(1, 10):
     page = os.environ.get(f"FB_PAGE_{i}")
     if page:
         FB_PAGES.append(page)
@@ -28,16 +28,11 @@ STATE_FILE = "state.json"
 
 MOBILE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
     'DNT': '1',
     'Connection': 'keep-alive',
     'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Cache-Control': 'max-age=0',
 }
 
 def send_whatsapp(msg):
@@ -45,22 +40,46 @@ def send_whatsapp(msg):
         return
     try:
         url = f"https://api.callmebot.com/whatsapp.php?phone={PHONE_NUMBER}&text={requests.utils.quote(msg)}&apikey={API_KEY}"
-        requests.get(url, timeout=15)
-    except: 
-        pass
+        resp = requests.get(url, timeout=15)
+        print(f"WhatsApp sent: {resp.status_code}")
+    except Exception as e: 
+        print(f"WhatsApp error: {e}")
 
 def load_state():
-    default = {"levis": {"sale": "", "count": 0}, "owndays": {"in_stock": False, "count": 0}, "fb": {}}
+    default = {
+        "levis": {"sale": "", "count": 0}, 
+        "owndays": {"in_stock": False, "count": 0}, 
+        "fb": {}
+    }
     if os.path.exists(STATE_FILE):
         try: 
-            return json.load(open(STATE_FILE, "r"))
-        except: 
-            pass
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e: 
+            print(f"State load error: {e}")
     return default
 
+def init_fb_state(state):
+    """Initialize FB state for all pages so they appear in JSON even before first check"""
+    if "fb" not in state:
+        state["fb"] = {}
+    for page in FB_PAGES:
+        if page not in state["fb"]:
+            state["fb"][page] = {
+                "last_id": "",
+                "count": 0,
+                "last_check": None,
+                "status": "initialized"
+            }
+    return state
+
 def save_state(state):
-    with open(STATE_FILE, "w") as f: 
-        json.dump(state, f, indent=2)
+    try:
+        with open(STATE_FILE, "w") as f: 
+            json.dump(state, f, indent=2)
+        print(f"State saved to {STATE_FILE}")
+    except Exception as e:
+        print(f"State save error: {e}")
 
 def check_owndays(state):
     try:
@@ -113,137 +132,168 @@ def check_levis(state):
 
 def extract_username(url):
     parsed = urlparse(url)
-    return parsed.path.strip('/').split('/')[-1].split('?')[0]
-
-def parse_facebook_posts(html):
-    """Extract posts from m.facebook.com HTML"""
-    posts = []
-    
-    # Method 1: Parse HTML structure
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    # Find article elements (posts)
-    articles = soup.find_all('div', role='article')
-    if not articles:
-        articles = soup.find_all('div', {'data-ft': True})
-    
-    for article in articles[:3]:
-        post_data = {'text': '', 'post_id': '', 'time': ''}
-        
-        # Get text
-        text_elem = article.find('p') or article.find('span')
-        if text_elem:
-            post_data['text'] = text_elem.get_text(strip=True)
-        
-        # Get post ID from data-ft
-        data_ft = article.get('data-ft', '')
-        if data_ft:
-            try:
-                ft_json = json.loads(data_ft)
-                post_data['post_id'] = str(ft_json.get('top_level_post_id', ft_json.get('mf_story_key', '')))
-            except:
-                pass
-        
-        # Get timestamp
-        time_elem = article.find('abbr')
-        if time_elem:
-            post_data['time'] = time_elem.get_text(strip=True)
-        
-        if post_data['text'] or post_data['post_id']:
-            posts.append(post_data)
-    
-    return posts
+    path = parsed.path.strip('/').split('/')[-1]
+    return path.split('?')[0] if path else None
 
 def check_facebook(page_url, state):
+    """Check Facebook with detailed logging"""
     username = extract_username(page_url)
     if not username:
+        print(f"Could not extract username from {page_url}")
+        state["fb"][page_url]["status"] = "invalid_url"
         return state
+    
+    print(f"\n--- Checking Facebook: {username} ---")
+    
+    # Ensure state entry exists
+    if page_url not in state["fb"]:
+        state["fb"][page_url] = {"last_id": "", "count": 0}
     
     try:
         time.sleep(random.uniform(3, 6))
         
-        # Parse cookies if provided
+        # Parse cookies
         cookies = {}
         if FB_COOKIES:
             for cookie in FB_COOKIES.split(';'):
                 if '=' in cookie:
                     k, v = cookie.strip().split('=', 1)
                     cookies[k.strip()] = v.strip()
+            print(f"Using {len(cookies)} cookies")
+        else:
+            print("WARNING: No FB_COOKIES set - likely to fail")
         
         url = f"https://m.facebook.com/{username}"
+        print(f"Fetching: {url}")
+        
         resp = requests.get(url, headers=MOBILE_HEADERS, cookies=cookies, timeout=30)
+        print(f"Status: {resp.status_code}")
+        print(f"URL after redirects: {resp.url}")
         
-        if resp.status_code != 200:
-            print(f"FB HTTP {resp.status_code} for {username}")
+        # DEBUG: Save HTML to see what we got
+        if "login" in resp.url.lower() or "login" in resp.text.lower()[:1000]:
+            print("ERROR: Redirected to login page!")
+            state["fb"][page_url]["status"] = "login_required"
+            # Save debug HTML
+            with open(f"debug_{username}.html", "w", encoding="utf-8") as f:
+                f.write(resp.text[:5000])
+            print(f"Saved debug HTML to debug_{username}.html")
             return state
         
-        posts = parse_facebook_posts(resp.text)
+        # Parse posts
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        articles = soup.find_all('div', role='article')
+        print(f"Found {len(articles)} article elements")
         
-        if not posts:
-            print(f"No posts found for {username}")
+        if not articles:
+            # Try alternative selectors
+            articles = soup.find_all('div', {'data-ft': True})
+            print(f"Found {len(articles)} elements with data-ft")
+        
+        if not articles:
+            print("ERROR: No posts found - page structure changed or blocked")
+            state["fb"][page_url]["status"] = "no_posts_found"
+            # Save debug HTML
+            with open(f"debug_{username}.html", "w", encoding="utf-8") as f:
+                f.write(resp.text[:5000])
             return state
         
-        # Get first valid post
-        latest = None
-        for p in posts:
-            text = p.get('text', '')
-            if text:
-                latest = p
-                break
+        # Get first post
+        article = articles[0]
+        text_elem = article.find('p') or article.find('span')
+        text = text_elem.get_text(strip=True) if text_elem else ""
         
-        if not latest:
-            latest = posts[0]
+        # Get post ID
+        data_ft = article.get('data-ft', '')
+        post_id = ""
+        if data_ft:
+            try:
+                ft_json = json.loads(data_ft)
+                post_id = str(ft_json.get('top_level_post_id', ft_json.get('mf_story_key', '')))
+            except:
+                pass
         
-        text = latest.get('text') or "(Media post)"
-        post_id = str(latest.get('post_id') or hash(text[:50]))
+        if not post_id and text:
+            post_id = str(hash(text[:100]))[:16]
         
-        if "fb" not in state:
-            state["fb"] = {}
+        print(f"Post ID: {post_id[:30]}...")
+        print(f"Text preview: {text[:100]}...")
         
-        page_state = state["fb"].get(page_url, {"last_id": "", "count": 0})
+        # Update state
+        page_state = state["fb"][page_url]
+        page_state["last_check"] = datetime.now().isoformat()
         
-        if page_state["last_id"] != post_id:
-            print(f"New FB post from {username}")
+        if not text and not post_id:
+            print("WARNING: Empty post")
+            page_state["status"] = "empty_post"
+            return state
+        
+        if page_state.get("last_id") != post_id:
+            print(f"NEW POST DETECTED!")
             page_state["last_id"] = post_id
             page_state["count"] = 1
+            page_state["status"] = "new_post"
             
             snippet = text[:300] if len(text) > 300 else text
             send_whatsapp(f"📱 *NEW FB POST* (1/5)\nPage: {username}\n\n{snippet}...\n\n🔗 {page_url}")
-        elif 0 < page_state["count"] < 5:
+        elif 0 < page_state.get("count", 0) < 5:
             page_state["count"] += 1
+            page_state["status"] = "reminder"
             snippet = text[:150] if len(text) > 150 else text
             send_whatsapp(f"📱 *FB REMINDER* ({page_state['count']}/5)\nPage: {username}\n\n{snippet}...")
+        else:
+            page_state["status"] = "no_change"
+            print("No new post")
         
         state["fb"][page_url] = page_state
         
     except Exception as e:
-        print(f"FB error for {username}: {e}")
+        print(f"ERROR checking {username}: {e}")
+        import traceback
+        traceback.print_exc()
+        state["fb"][page_url]["status"] = f"error: {str(e)}"
     
     return state
 
 def main():
     if os.environ.get("STOP_ALERTS", "").lower() == "true":
+        print("STOP_ALERTS is true, exiting")
         return
     
-    time.sleep(random.uniform(5, 20))
+    time.sleep(random.uniform(2, 5))
     state = load_state()
     
-    print(f"Starting check at {datetime.now().isoformat()}")
-    print(f"Monitoring {len(FB_PAGES)} Facebook pages: {FB_PAGES}")
+    # Initialize FB state for all pages first
+    state = init_fb_state(state)
     
+    print(f"\n{'='*50}")
+    print(f"Starting check at {datetime.now().isoformat()}")
+    print(f"Pages to check: {FB_PAGES}")
+    print(f"{'='*50}\n")
+    
+    # Check OWNDAYS
     state = check_owndays(state)
     time.sleep(random.uniform(2, 4))
     
+    # Check Levi's
     state = check_levis(state)
     time.sleep(random.uniform(2, 4))
     
+    # Check Facebook pages
     for page_url in FB_PAGES:
         if page_url:
             state = check_facebook(page_url, state)
             time.sleep(random.uniform(5, 10))
     
+    print(f"\n{'='*50}")
+    print("Saving state...")
     save_state(state)
-    print("Check completed")
+    
+    # Print final state for debugging
+    print(f"\nFinal FB state:")
+    for url, data in state.get("fb", {}).items():
+        print(f"  {url[:50]}... : {data.get('status', 'unknown')}")
+    print(f"{'='*50}")
 
 if __name__ == "__main__":
     main()

@@ -10,31 +10,26 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        
-    - name: Install dependencies & Playwright
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests playwright beautifulsoup4 fake-useragent
+        pip install -r requirements.txt
         playwright install --with-deps chromium
-        
-    - name: Restore state file cache
+    - name: Restore state
       uses: actions/cache/restore@v4
       with:
         path: state.json
         key: state-${{ github.run_id }}
         restore-keys: |
           state-
-          
-    - name: Run monitoring script
+    - name: Run script
       env:
         CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
         CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
@@ -43,8 +38,7 @@ jobs:
         FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}
         STOP_ALERTS: ${{ vars.STOP_ALERTS }}
       run: python main.py
-      
-    - name: Save state file cache
+    - name: Save state
       uses: actions/cache/save@v4
       if: always()
       with:

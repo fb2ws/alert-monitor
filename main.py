@@ -284,7 +284,7 @@ def check_facebook_page(page_id, state):
             
             # Go to page with proper navigation wait
             try:
-                page.goto(fb_url, timeout=90000, wait_until="networkidle", timeout=90000)
+                page.goto(fb_url, wait_until="networkidle", timeout=90000)
             except Exception as goto_err:
                 result["status"] = "navigation_failed"
                 result["details"] = f"Goto error: {str(goto_err)[:100]}"

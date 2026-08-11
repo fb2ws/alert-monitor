@@ -11,7 +11,16 @@ from bs4 import BeautifulSoup
 # --- Configuration ---
 PHONE_NUMBER = os.environ.get("CALLMEBOT_PHONE")
 API_KEY = os.environ.get("CALLMEBOT_API_KEY")
-FB_PAGES = json.loads(os.environ.get("FB_PAGES", "[]"))
+
+# Read individual page secrets (FB_PAGE_1, FB_PAGE_2, FB_PAGE_3)
+FB_PAGES = []
+for i in range(1, 10):  # Check FB_PAGE_1 through FB_PAGE_9
+    page = os.environ.get(f"FB_PAGE_{i}")
+    if page:
+        FB_PAGES.append(page)
+
+print(f"Loaded {len(FB_PAGES)} Facebook pages: {FB_PAGES}")
+
 FB_COOKIES = os.environ.get("FB_COOKIES", "")
 LEVIS_URL = "https://www.levi.com/US/en_US/search/polo/facets/feature-gender/men/sort/price-asc"
 OWNDAYS_URL = "https://www.owndays.com/jp/en/products/SENICHI31?sku=6259"
@@ -107,43 +116,18 @@ def extract_username(url):
     return parsed.path.strip('/').split('/')[-1].split('?')[0]
 
 def parse_facebook_posts(html):
-    """
-    Extract posts from m.facebook.com HTML
-    Looks for the data in embedded JSON and HTML structure
-    """
+    """Extract posts from m.facebook.com HTML"""
     posts = []
     
-    # Method 1: Look for embedded JSON in script tags
-    # Facebook embeds post data in <script> tags as JSON
-    script_pattern = r'<script[^>]*>(.*?)</script>'
-    scripts = re.findall(script_pattern, html, re.DOTALL)
-    
-    for script in scripts:
-        # Look for post data patterns
-        if '"story":' in script or '"post_id":' in script:
-            try:
-                # Extract JSON-like structures
-                json_matches = re.findall(r'\{[^{}]*"post_id"[^{}]*\}', script)
-                for match in json_matches:
-                    try:
-                        data = json.loads(match)
-                        if 'post_id' in data or 'story' in data:
-                            posts.append(data)
-                    except:
-                        pass
-            except:
-                pass
-    
-    # Method 2: Parse HTML structure directly
+    # Method 1: Parse HTML structure
     soup = BeautifulSoup(html, 'html.parser')
     
     # Find article elements (posts)
     articles = soup.find_all('div', role='article')
     if not articles:
-        # Fallback: look for specific div patterns
         articles = soup.find_all('div', {'data-ft': True})
     
-    for article in articles[:3]:  # Only top 3
+    for article in articles[:3]:
         post_data = {'text': '', 'post_id': '', 'time': ''}
         
         # Get text
@@ -151,7 +135,7 @@ def parse_facebook_posts(html):
         if text_elem:
             post_data['text'] = text_elem.get_text(strip=True)
         
-        # Get post ID from data-ft attribute
+        # Get post ID from data-ft
         data_ft = article.get('data-ft', '')
         if data_ft:
             try:
@@ -202,16 +186,15 @@ def check_facebook(page_url, state):
         # Get first valid post
         latest = None
         for p in posts:
-            text = p.get('text') or p.get('message', '')
-            pid = p.get('post_id') or ''
-            if text or pid:
+            text = p.get('text', '')
+            if text:
                 latest = p
                 break
         
         if not latest:
-            return state
+            latest = posts[0]
         
-        text = latest.get('text') or latest.get('message') or "(Media post)"
+        text = latest.get('text') or "(Media post)"
         post_id = str(latest.get('post_id') or hash(text[:50]))
         
         if "fb" not in state:
@@ -246,6 +229,7 @@ def main():
     state = load_state()
     
     print(f"Starting check at {datetime.now().isoformat()}")
+    print(f"Monitoring {len(FB_PAGES)} Facebook pages: {FB_PAGES}")
     
     state = check_owndays(state)
     time.sleep(random.uniform(2, 4))

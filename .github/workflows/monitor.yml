@@ -7,46 +7,52 @@ on:
   push:
     branches: [ "main", "master" ]
 
+concurrency:
+  group: stock-monitor
+  cancel-in-progress: false  # Prevent overlapping runs
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 10      # Kill after 10 min max
     
     steps:
-    - uses: actions/checkout@v4
-    
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
+          
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          
+      - name: Install Playwright
+        run: |
+          playwright install chromium
+          playwright install-deps chromium --with-deps
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         
-    - name: Cache pip
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+      - name: Run monitor
+        env:
+          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+          CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
+          FB_PAGE_ID_1: ${{ secrets.FB_PAGE_ID_1 }}
+          FB_PAGE_ID_2: ${{ secrets.FB_PAGE_ID_2 }}
+          FB_PAGE_ID_3: ${{ secrets.FB_PAGE_ID_3 }}
+        run: python main.py
         
-    - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -r requirements.txt
-        
-    - name: Download previous state
-      uses: actions/download-artifact@v4
-      with:
-        name: monitor-state
-        path: .
-      continue-on-error: true
-        
-    - name: Run monitor
-      env:
-        CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
-        CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
-        FB_PAGES: ${{ secrets.FB_PAGES }}
-        FB_COOKIES: ${{ secrets.FB_COOKIES }}
-      run: python main.py
-        
-    - name: Upload state
-      uses: actions/upload-artifact@v4
-      with:
-        name: monitor-state
-        path: state.json
-        retention-days: 30
+      - name: Upload state artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-file
+          path: state.json
+          retention-days: 1

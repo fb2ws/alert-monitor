@@ -9,7 +9,8 @@ from playwright.sync_api import sync_playwright
 # --- Configuration ---
 PHONE_NUMBER = os.environ.get("CALLMEBOT_PHONE")
 API_KEY = os.environ.get("CALLMEBOT_API_KEY")
-FB_PAGE_IDS = [os.environ.get(f"FB_PAGE_ID_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_ID_{i}")]
+# Fixed: Use FB_PAGE_1, FB_PAGE_2, FB_PAGE_3 (matching your GitHub secrets)
+FB_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_{i}")]
 
 # URLs
 LEVIS_URL = "https://www.levi.com/US/en_US/search/polo/facets/feature-gender/men/sort/price-asc"
@@ -62,14 +63,12 @@ def save_state(state):
 def check_owndays_http(state):
     """Check OwnDays inventory using simple HTTP (faster than browser)"""
     try:
-        # Try with and without session for cookie persistence
         session = requests.Session()
         session.headers.update(COMMON_HEADERS)
         
         resp = session.get(OWNDAYS_URL, timeout=30, allow_redirects=True)
         resp.raise_for_status()
         
-        # Parse stock status from HTML
         soup = BeautifulSoup(resp.text, "html.parser")
         page_text = resp.text.lower()
         
@@ -129,7 +128,6 @@ def check_levis_http(state):
         # Also check banner/promo text
         if not sale:
             if any(banner in content for banner in ["sale", "clearance", "special offer", "promotion"]):
-                # Need to check if it's actually discounting on polo items specifically
                 if "polo" in content and any(pct in content for pct in ["50", "60", "70"]):
                     if "off" in content:
                         sale = "active promotion"
@@ -179,10 +177,7 @@ def check_facebook_page(page_url, state):
             
             page = context.new_page()
             
-            # Navigate with generous timeout
             page.goto(page_url, timeout=60000, wait_until="domcontentloaded")
-            
-            # Wait for posts to render
             time.sleep(4)
             
             # Remove login dialogs and overlays
@@ -223,7 +218,6 @@ def check_facebook_page(page_url, state):
                     for el in elements:
                         if el:
                             text = el.inner_text().strip() if el.is_visible() else ""
-                            # Filter out obvious noise
                             if len(text) > 20 and "log in" not in text.lower() and "continue" not in text.lower():
                                 post_text = text
                                 break
@@ -284,7 +278,7 @@ def main():
     
     # Slow checks last (Playwright takes minutes)
     print("[STEP 3] Checking Facebook pages...")
-    for page_id in FB_PAGE_IDS:
+    for page_id in FB_PAGES:
         if page_id:
             fb_url = f"https://www.facebook.com/{page_id}/posts/"
             print(f"      → {fb_url}")

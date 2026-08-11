@@ -9,48 +9,47 @@ on:
 
 concurrency:
   group: stock-monitor
-  cancel-in-progress: false  # Prevent overlapping runs
+  cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10      # Kill after 10 min max
-    
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
+
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt') }}
-          
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          
-      - name: Install Playwright
-        run: |
-          playwright install chromium
-          playwright install-deps chromium --with-deps
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        
+          key: ${{ runner.os }}-playwright-chromium
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install chromium
+
+      - name: Install Playwright system dependencies
+        run: playwright install-deps chromium
+
       - name: Run monitor
         env:
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
           CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
-          FB_PAGE_ID_1: ${{ secrets.FB_PAGE_ID_1 }}
-          FB_PAGE_ID_2: ${{ secrets.FB_PAGE_ID_2 }}
-          FB_PAGE_ID_3: ${{ secrets.FB_PAGE_ID_3 }}
+          FB_PAGE_1: ${{ secrets.FB_PAGE_1 }}
+          FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
+          FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}
         run: python main.py
-        
-      - name: Upload state artifact
+
+      - name: Save state
         uses: actions/upload-artifact@v4
         with:
           name: state-file

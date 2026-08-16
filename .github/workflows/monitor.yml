@@ -28,7 +28,6 @@ jobs:
     - name: Install Playwright Chromium & Dependencies
       run: |
         sudo apt-get update
-        # Playwright 1.46.0 natively handles Ubuntu 24.04 dependencies
         playwright install --with-deps chromium
         
     - name: Restore state file memory (Cache)
@@ -43,8 +42,9 @@ jobs:
       env:
         TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
         TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
-        MY_PHONE: ${{ secrets.MY_PHONE }}
         TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+        TWILIO_CONTENT_SID: ${{ secrets.TWILIO_CONTENT_SID }}
+        MY_PHONE: ${{ secrets.MY_PHONE }}
         FB_PAGE_1: ${{ secrets.FB_PAGE_1 }}
         FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
         FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}

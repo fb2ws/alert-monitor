@@ -28,29 +28,55 @@ def get_hk_time():
     return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def send_whatsapp(msg):
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and MY_PHONE):
-        print("Twilio credentials missing.")
+    # 1. Safely retrieve variables (assuming they are set in your environment)
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    my_phone = os.environ.get("MY_PHONE")
+    twilio_from = os.environ.get("TWILIO_FROM")
+    content_sid = os.environ.get("TWILIO_CONTENT_SID")
+
+    # 2. Check ALL required variables, importantly including the sender number
+    if not all([account_sid, auth_token, my_phone, twilio_from]):
+        print("Twilio credentials or phone numbers missing.")
         return False
+
     try:
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        to_num = MY_PHONE if MY_PHONE.startswith("whatsapp:") else f"whatsapp:{MY_PHONE}"
-        from_num = TWILIO_FROM if TWILIO_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_FROM}"
+        # 3. Initialize the Client
+        client = Client(account_sid, auth_token)
         
-        # Using ContentSid to bypass the 24h window restriction
-        if TWILIO_CONTENT_SID:
+        # Ensure numbers are formatted with the 'whatsapp:' prefix
+        to_num = my_phone if my_phone.startswith("whatsapp:") else f"whatsapp:{my_phone}"
+        from_num = twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}"
+        
+        # 4. Route the message request
+        if content_sid:
+            # Send using an approved Content Template to bypass the 24h rule
+            # NOTE: Your Twilio template MUST have exactly one variable configured as {{1}}
             message = client.messages.create(
                 from_=from_num,
                 to=to_num,
-                content_sid=TWILIO_CONTENT_SID,
-                content_variables=json.dumps({"1": msg})
+                content_sid=content_sid,
+                content_variables=json.dumps({"1": msg}) 
             )
         else:
-            message = client.messages.create(body=msg, from_=from_num, to=to_num)
+            # Send a freeform message (Only works if recipient replied in the last 24 hours)
+            message = client.messages.create(
+                body=msg, 
+                from_=from_num, 
+                to=to_num
+            )
             
         print(f"Twilio Success! SID: {message.sid}")
         return True
+
+    # 5. Catch Twilio-specific errors to expose the actual API rejection reason
+    except TwilioRestException as e:
+        print(f"--- TWILIO API ERROR ---")
+        print(f"Code: {e.code} | Status: {e.status}")
+        print(f"Message: {e.msg}")
+        return False
     except Exception as e:
-        print(f"--- TWILIO ERROR ---")
+        print(f"--- GENERAL ERROR ---")
         print(f"Error: {str(e)}")
         return False
 

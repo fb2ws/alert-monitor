@@ -24,105 +24,128 @@ STATE_FILE = "state.json"
 # HK Timezone (UTC+8 )
 HK_TZ = timezone(timedelta(hours=8))
 
-def send_whatsapp_test(msg: str) -> bool:
-    print("\n==================================================")
-    print("           TWILIO WHATSAPP TEST RUNNER            ")
-    print("==================================================")
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"levis": {"sale": "", "count": 0}, "owndays": {"in_stock": False, "count": 0}, "fb": {}}
 
-    # 1. Inspect Environment Variables
+def send_whatsapp_test(msg: str) -> bool:
+    logs = []
+
+    def log(entry: str):
+        print(entry)
+        logs.append(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] {entry}")
+
+    log("==================================================")
+    log("           TWILIO WHATSAPP TEST RUNNER            ")
+    log("==================================================")
+
+    # 1. Environment Variable Checks
+    log("[1/5] Checking Environment Variables...")
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
     my_phone = os.environ.get("MY_PHONE")
     twilio_from = os.environ.get("TWILIO_FROM")
     content_sid = os.environ.get("TWILIO_CONTENT_SID")
 
-    print("[1/5] Checking Environment Variables...")
-    print(f"  • TWILIO_ACCOUNT_SID: {'✅ Detected (' + account_sid[:6] + '...)' if account_sid else '❌ MISSING'}")
-    print(f"  • TWILIO_AUTH_TOKEN:  {'✅ Detected (' + '*' * 8 + ')' if auth_token else '❌ MISSING'}")
-    print(f"  • MY_PHONE:           {'✅ Detected (' + str(my_phone) + ')' if my_phone else '❌ MISSING'}")
-    print(f"  • TWILIO_FROM:        {'✅ Detected (' + str(twilio_from) + ')' if twilio_from else '❌ MISSING'}")
-    print(f"  • TWILIO_CONTENT_SID: {'ℹ️  Detected (' + content_sid + ')' if content_sid else 'ℹ️  Not set (Using Freeform)'}")
+    log(f"  • TWILIO_ACCOUNT_SID: {'✅ Set (' + account_sid[:6] + '...)' if account_sid else '❌ MISSING'}")
+    log(f"  • TWILIO_AUTH_TOKEN:  {'✅ Set' if auth_token else '❌ MISSING'}")
+    log(f"  • MY_PHONE:           {my_phone if my_phone else '❌ MISSING'}")
+    log(f"  • TWILIO_FROM:        {twilio_from if twilio_from else '❌ MISSING'}")
+    log(f"  • TWILIO_CONTENT_SID: {content_sid if content_sid else 'ℹ️  Not set (Using Freeform)'}")
+
+    success = False
+    metadata = {}
 
     if not all([account_sid, auth_token, my_phone, twilio_from]):
-        print("\n❌ CRITICAL ERROR: Required environment variables are missing! Aborting test.")
-        return False
+        log("❌ CRITICAL ERROR: One or more required environment variables are missing!")
+    else:
+        # 2. Number Formatting
+        log("[2/5] Formatted Target Destinations...")
+        to_num = my_phone if my_phone.startswith("whatsapp:") else f"whatsapp:{my_phone}"
+        from_num = twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}"
+        log(f"  • Sender (From):     {from_num}")
+        log(f"  • Recipient (To):    {to_num}")
 
-    # 2. Format Phone Numbers
-    to_num = my_phone if my_phone.startswith("whatsapp:") else f"whatsapp:{my_phone}"
-    from_num = twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}"
+        try:
+            # 3. Client Initialization
+            log("[3/5] Initializing Twilio Client...")
+            client = Client(account_sid, auth_token)
 
-    print("\n[2/5] Formatted Target Destinations...")
-    print(f"  • Sender (From):     {from_num}")
-    print(f"  • Recipient (To):    {to_num}")
+            # 4. API Credential Verification
+            log("[4/5] Validating Credentials with Twilio API...")
+            account_info = client.api.v2010.accounts(account_sid).fetch()
+            log(f"  • Account Name:   {account_info.friendly_name}")
+            log(f"  • Account Status: {account_info.status.upper()}")
+            log("  ✅ Credentials verified successfully!")
 
-    try:
-        # 3. Initialize Twilio Client
-        print("\n[3/5] Initializing Twilio Client...")
-        client = Client(account_sid, auth_token)
+            # 5. Dispatch Message
+            log("[5/5] Attempting to Send WhatsApp Message...")
+            if content_sid:
+                log("  • Dispatch Mode: Content Template SID")
+                payload = {"1": msg}
+                log(f"  • Variable Payload: {json.dumps(payload)}")
+                res = client.messages.create(
+                    from_=from_num,
+                    to=to_num,
+                    content_sid=content_sid,
+                    content_variables=json.dumps(payload)
+                )
+            else:
+                log("  • Dispatch Mode: Direct Freeform Text")
+                log(f"  • Text Body: \"{msg}\"")
+                res = client.messages.create(body=msg, from_=from_num, to=to_num)
 
-        # 4. Active Credential & Account Status Validation (API Call)
-        print("[4/5] Validating Credentials with Twilio API...")
-        account_info = client.api.v2010.accounts(account_sid).fetch()
-        print(f"  • Account Name:   {account_info.friendly_name}")
-        print(f"  • Account Status: {account_info.status.upper()}")
-        print(f"  • Account Type:   {account_info.type.upper()}")
-        print("  ✅ Credentials verified successfully with Twilio!")
+            log("==================================================")
+            log(" 🎉 MESSAGE ACCEPTED BY TWILIO!")
+            log(f"  • Message SID:  {res.sid}")
+            log(f"  • Status:       {res.status}")
+            log("==================================================")
 
-        # 5. Dispatch Message
-        print("\n[5/5] Attempting to Send WhatsApp Message...")
-        if content_sid:
-            print("  • Dispatch Mode: Content Template SID")
-            payload = {"1": msg}
-            print(f"  • Variable Payload: {json.dumps(payload)}")
-            
-            message = client.messages.create(
-                from_=from_num,
-                to=to_num,
-                content_sid=content_sid,
-                content_variables=json.dumps(payload)
-            )
-        else:
-            print("  • Dispatch Mode: Direct Freeform Text")
-            print(f"  • Text Body: \"{msg}\"")
-            
-            message = client.messages.create(
-                body=msg,
-                from_=from_num,
-                to=to_num
-            )
+            metadata = {
+                "message_sid": res.sid,
+                "status": res.status,
+                "to": to_num,
+                "from": from_num,
+                "error_code": res.error_code,
+                "error_message": res.error_message
+            }
+            success = True
 
-        print("\n==================================================")
-        print(" 🎉 MESSAGE SENT SUCCESSFULLY!")
-        print("==================================================")
-        print(f"  • Message SID:  {message.sid}")
-        print(f"  • Status:       {message.status}")
-        print(f"  • Date Created: {message.date_created}")
-        print(f"  • Price/Unit:   {message.price} {message.price_unit}")
-        print("==================================================\n")
-        return True
+        except TwilioRestException as e:
+            log("==================================================")
+            log(" 🚨 TWILIO REST API ERROR DETECTED")
+            log(f"  • HTTP Status:  {e.status}")
+            log(f"  • Error Code:   {e.code}")
+            log(f"  • Details:      {e.msg}")
+            log("==================================================")
+            metadata = {"error_code": e.code, "error_msg": e.msg, "http_status": e.status}
 
-    except TwilioRestException as e:
-        print("\n==================================================")
-        print(" 🚨 TWILIO REST API ERROR DETECTED")
-        print("==================================================")
-        print(f"  • HTTP Status:  {e.status}")
-        print(f"  • Error Code:   {e.code}")
-        print(f"  • Details:      {e.msg}")
-        if e.code == 20003:
-            print("  💡 Tip: Auth Token or Account SID is invalid.")
-        elif e.code == 63016:
-            print("  💡 Tip: Message failed because recipient is outside the 24h window and no Content Template was used.")
-        print("==================================================\n")
-        return False
-    except Exception as e:
-        print("\n==================================================")
-        print(" ❌ SYSTEM / PYTHON EXCEPTION")
-        print("==================================================")
-        print(f"  • Error Type: {type(e).__name__}")
-        print(f"  • Details:    {str(e)}")
-        print("==================================================\n")
-        return False
+        except Exception as e:
+            log("==================================================")
+            log(" ❌ SYSTEM / PYTHON EXCEPTION")
+            log(f"  • Error Type: {type(e).__name__}")
+            log(f"  • Details:    {str(e)}")
+            log("==================================================")
+            metadata = {"error": str(e)}
 
+    # Save execution record and logs to state.json
+    state = load_state()
+    state["last_twilio_run"] = {
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "success": success,
+        "logs": logs,
+        "metadata": metadata
+    }
+
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+    return success
 def get_hk_time():
     return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -331,6 +354,4 @@ def main():
     print("--------------------------\n")
 
 if __name__ == "__main__":
-    # Test execution message
-    test_payload = "🤖 Test Run Alert: Twilio credentials verification active."
-    send_whatsapp_test(test_payload)
+    send_whatsapp_test("🤖 Test Run Alert: Twilio credentials verification active.")

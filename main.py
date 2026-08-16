@@ -10,8 +10,8 @@ from twilio.rest import Client
 # --- Configuration ---
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = os.environ.get("TWILIO_FROM", "whatsapp:+14155238886") # Default Twilio Sandbox or your number
-MY_PHONE = os.environ.get("MY_PHONE") # e.g. +85212345678
+TWILIO_FROM = os.environ.get("TWILIO_FROM", "whatsapp:+17372507786")
+MY_PHONE = os.environ.get("MY_PHONE")
 
 FB_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_{i}")]
 
@@ -28,7 +28,7 @@ def get_hk_time():
 def send_whatsapp(msg):
     if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and MY_PHONE):
         print("Twilio credentials missing. Message not sent.")
-        return
+        return False
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         to_number = MY_PHONE if MY_PHONE.startswith("whatsapp:") else f"whatsapp:{MY_PHONE}"
@@ -40,8 +40,10 @@ def send_whatsapp(msg):
             to=to_number
         )
         print(f"Twilio message sent successfully. SID: {message.sid}")
+        return True
     except Exception as e:
         print(f"Twilio Error: {e}")
+        return False
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -65,7 +67,7 @@ def log_event(state, message):
     entry = f"[{ts}] {message}"
     print(entry)
     state.setdefault("history", []).append(entry)
-    if len(state["history"]) > 30: state["history"] = state["history"][-30:]
+    if len(state["history"]) > 40: state["history"] = state["history"][-40:]
     return state
 
 def check_owndays(page, state):
@@ -80,12 +82,12 @@ def check_owndays(page, state):
         if is_in_stock:
             if not mon["in_stock"]:
                 mon["count"] = 1
-                send_whatsapp(f"🟢 *OWNDAYS STOCK (1/5)* 🟢\nItem is IN STOCK!\n{OWNDAYS_URL}")
-                mon["status"] = "ALERTING: 1/5 reminders sent"
+                success = send_whatsapp(f"🟢 *OWNDAYS STOCK (1/5)* 🟢\nItem is IN STOCK!\n{OWNDAYS_URL}")
+                mon["status"] = "ALERTING: 1/5 reminders sent" if success else "ERROR: Twilio failed to send"
             elif mon["count"] < 5:
                 mon["count"] += 1
-                send_whatsapp(f"🟢 *OWNDAYS REMINDER ({mon['count']}/5)* 🟢\n{OWNDAYS_URL}")
-                mon["status"] = f"ALERTING: {mon['count']}/5 reminders sent"
+                success = send_whatsapp(f"🟢 *OWNDAYS REMINDER ({mon['count']}/5)* 🟢\n{OWNDAYS_URL}")
+                mon["status"] = f"ALERTING: {mon['count']}/5 reminders sent" if success else "ERROR: Twilio failed to send"
             else:
                 mon["status"] = "PAUSED: 5/5 reminders completed"
             mon["in_stock"] = True
@@ -107,12 +109,12 @@ def check_levis(page, state):
         if sale:
             if mon["sale"] != sale:
                 mon["count"] = 1
-                send_whatsapp(f"🚨 *LEVI'S SALE (1/5)* 🚨\nFound: *{sale.upper()}*")
-                mon["status"] = f"ALERTING: New {sale} found (1/5)"
+                success = send_whatsapp(f"🚨 *LEVI'S SALE (1/5)* 🚨\nFound: *{sale.upper()}*")
+                mon["status"] = f"ALERTING: New {sale} found (1/5)" if success else "ERROR: Twilio failed"
             elif mon["count"] < 5:
                 mon["count"] += 1
-                send_whatsapp(f"🚨 *LEVI'S REMINDER ({mon['count']}/5)* 🚨\n*{sale.upper()}* active")
-                mon["status"] = f"ALERTING: {sale} active ({mon['count']}/5)"
+                success = send_whatsapp(f"🚨 *LEVI'S REMINDER ({mon['count']}/5)* 🚨\n*{sale.upper()}* active")
+                mon["status"] = f"ALERTING: {sale} active ({mon['count']}/5)" if success else "ERROR: Twilio failed"
             else:
                 mon["status"] = f"PAUSED: 5/5 reminders for {sale} done"
             mon["sale"] = sale
@@ -134,62 +136,54 @@ def kill_facebook_modals(page):
 
 def check_facebook(page, url, state):
     base_url = url.rstrip('/')
-    photo_url = base_url + "/photos/"
     fb_monitors = state["monitors"].setdefault("fb", {})
-    f = fb_monitors.setdefault(url, {"status": "Initializing", "id": "", "last_check": ""})
+    f = fb_monitors.setdefault(url, {"status": "Initializing", "last_post_text": "", "last_check": ""})
     f["last_check"] = get_hk_time()
     
     try:
-        page.goto(photo_url, timeout=60000)
+        page.goto(base_url, timeout=60000)
         time.sleep(random.uniform(8, 12))
         
         kill_facebook_modals(page)
         
         body_text = page.inner_text("body")
         if "Log In" in body_text and "Email address or mobile number" in body_text:
-            f["status"] = "Wall Detected: Hard Login Required"
-            log_event(state, f"FB Wall hit on {base_url}")
-            return state
+            page.mouse.wheel(0, 500)
+            time.sleep(3)
 
-        latest_id = ""
-        photo_links = page.locator("a[href*='/photo/']").all()
-        for link in photo_links:
-            try:
-                href = link.get_attribute("href")
-                if href and "/photo/" in href:
-                    if "fbid=" in href:
-                        latest_id = href.split("fbid=")[1].split("&")[0]
-                    else:
-                        latest_id = href.split("/photo/")[1].split("/")[0]
-                    break
-            except:
-                continue
+        # Grab post text using Facebook's exact preview attribute from fbtest.rtf
+        post_elements = page.locator("div[data-ad-comet-preview='message']").all()
+        latest_text = ""
         
-        if not latest_id:
-            post_links = page.locator("a[href*='/posts/']").all()
-            for link in post_links:
-                try:
-                    href = link.get_attribute("href")
-                    if href and "/posts/" in href:
-                        latest_id = href.split("/posts/")[1].split("/")[0]
-                        break
-                except:
-                    continue
+        if post_elements:
+            latest_text = post_elements[0].inner_text().strip()
+        
+        if not latest_text:
+            posts = page.locator("div[role='article']").all()
+            if posts:
+                latest_text = posts[0].inner_text().strip()[:200]
 
-        if not latest_id:
+        if not latest_text:
             snippet = body_text.replace('\n', ' ')[:80]
-            f["status"] = f"Idle: No ID found. Body: {snippet}"
-            log_event(state, f"FB No ID found for {base_url}. Snippet: {snippet}")
+            f["status"] = f"Idle: No post text found. Snippet: {snippet}"
+            log_event(state, f"FB No post text found for {base_url}.")
             return state
 
-        if f["id"] != latest_id:
-            old_id = f["id"]
-            f["id"] = latest_id
-            send_whatsapp(f"📱 *NEW FB POST* 📱\nPage: {url}")
-            f["status"] = f"NEW POST: Notified ID {latest_id} (Prev: {old_id})"
-            log_event(state, f"FB Alert sent for {url} (New ID: {latest_id})")
+        cleaned_text = ' '.join(latest_text.split())
+
+        if f.get("last_post_text") != cleaned_text:
+            f["last_post_text"] = cleaned_text
+            msg = f"📱 *NEW FB POST* 📱\nPage: {url}\n\n{cleaned_text[:300]}"
+            success = send_whatsapp(msg)
+            
+            if success:
+                f["status"] = f"NEW POST NOTIFIED: {cleaned_text[:50]}..."
+                log_event(state, f"FB WhatsApp sent for {url}")
+            else:
+                f["status"] = f"ERROR: Twilio failed for new post on {url}"
+                log_event(state, f"FB Twilio failed for {url}")
         else:
-            f["status"] = f"Idle: Up to date (ID {latest_id})"
+            f["status"] = f"Idle: Up to date ({cleaned_text[:30]}...)"
             
     except Exception as e: 
         f["status"] = f"ERROR: {str(e)[:50]}"

@@ -5,10 +5,14 @@ import random
 import requests
 from playwright.sync_api import sync_playwright
 from datetime import datetime, timezone, timedelta
+from twilio.rest import Client
 
 # --- Configuration ---
-PHONE_NUMBER = os.environ.get("CALLMEBOT_PHONE")
-API_KEY = os.environ.get("CALLMEBOT_API_KEY")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM = os.environ.get("TWILIO_FROM", "whatsapp:+14155238886") # Default Twilio Sandbox or your number
+MY_PHONE = os.environ.get("MY_PHONE") # e.g. +85212345678
+
 FB_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_{i}")]
 
 LEVIS_CACHE_URL = "https://webcache.googleusercontent.com/search?q=cache:https://www.levi.com/US/en_US/"
@@ -22,10 +26,22 @@ def get_hk_time():
     return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def send_whatsapp(msg):
-    if not (PHONE_NUMBER and API_KEY): return
-    url = f"https://api.callmebot.com/whatsapp.php?phone={PHONE_NUMBER}&text={requests.utils.quote(msg )}&apikey={API_KEY}"
-    try: requests.get(url, timeout=15)
-    except: pass
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and MY_PHONE):
+        print("Twilio credentials missing. Message not sent.")
+        return
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        to_number = MY_PHONE if MY_PHONE.startswith("whatsapp:") else f"whatsapp:{MY_PHONE}"
+        from_number = TWILIO_FROM if TWILIO_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_FROM}"
+        
+        message = client.messages.create(
+            body=msg,
+            from_=from_number,
+            to=to_number
+        )
+        print(f"Twilio message sent successfully. SID: {message.sid}")
+    except Exception as e:
+        print(f"Twilio Error: {e}")
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -107,7 +123,6 @@ def check_levis(page, state):
     return state
 
 def kill_facebook_modals(page):
-    """Attempt to close or remove login walls and cookie banners."""
     try:
         close_buttons = page.locator("div[aria-label='Close'], div[role='button']:has-text('Close'), i[data-visualcompletion='css-img']").all()
         for btn in close_buttons:

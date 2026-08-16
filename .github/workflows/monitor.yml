@@ -23,7 +23,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests playwright
+        pip install -r requirements.txt
         
     - name: Install Playwright Browsers & Dependencies
       run: |
@@ -40,8 +40,10 @@ jobs:
           
     - name: Run monitoring script
       env:
-        CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
-        CALLMEBOT_API_KEY: ${{ secrets.CALLMEBOT_API_KEY }}
+        TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+        TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+        MY_PHONE: ${{ secrets.MY_PHONE }}
+        TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
         FB_PAGE_1: ${{ secrets.FB_PAGE_1 }}
         FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
         FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}

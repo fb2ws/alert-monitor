@@ -1,76 +1,220 @@
-name: Alert Monitor System
+import os
+import json
+import time
+import random
+import requests
+from playwright.sync_api import sync_playwright
+from datetime import datetime, timezone, timedelta
+from twilio.rest import Client
 
-on:
-  workflow_dispatch:
-  repository_dispatch:
-    types: [trigger_monitor]
-  push:
-    branches: [ "main", "master" ]
+# --- Configuration ---
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_FROM = os.environ.get("TWILIO_FROM", "whatsapp:+14155238886") # Default Twilio Sandbox or your number
+MY_PHONE = os.environ.get("MY_PHONE") # e.g. +85212345678
 
-jobs:
-  monitor:
-    runs-on: ubuntu-latest
+FB_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_{i}")]
+
+LEVIS_CACHE_URL = "https://webcache.googleusercontent.com/search?q=cache:https://www.levi.com/US/en_US/"
+OWNDAYS_URL = "https://www.owndays.com/jp/en/products/SENICHI31?sku=6259"
+STATE_FILE = "state.json"
+
+# HK Timezone (UTC+8 )
+HK_TZ = timezone(timedelta(hours=8))
+
+def get_hk_time():
+    return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def send_whatsapp(msg):
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and MY_PHONE):
+        print("Twilio credentials missing. Message not sent.")
+        return
+    try:
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        to_number = MY_PHONE if MY_PHONE.startswith("whatsapp:") else f"whatsapp:{MY_PHONE}"
+        from_number = TWILIO_FROM if TWILIO_FROM.startswith("whatsapp:") else f"whatsapp:{TWILIO_FROM}"
+        
+        message = client.messages.create(
+            body=msg,
+            from_=from_number,
+            to=to_number
+        )
+        print(f"Twilio message sent successfully. SID: {message.sid}")
+    except Exception as e:
+        print(f"Twilio Error: {e}")
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try: 
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                if "monitors" in data: return data
+        except: pass
+    return {
+        "system": {"last_run": "", "total_runs": 0},
+        "monitors": {
+            "levis": {"status": "Initializing", "sale": "", "count": 0, "last_check": ""},
+            "owndays": {"status": "Initializing", "in_stock": False, "count": 0, "last_check": ""},
+            "fb": {}
+        },
+        "history": []
+    }
+
+def log_event(state, message):
+    ts = get_hk_time()
+    entry = f"[{ts}] {message}"
+    print(entry)
+    state.setdefault("history", []).append(entry)
+    if len(state["history"]) > 30: state["history"] = state["history"][-30:]
+    return state
+
+def check_owndays(page, state):
+    mon = state["monitors"]["owndays"]
+    mon["last_check"] = get_hk_time()
+    try:
+        page.goto(OWNDAYS_URL, timeout=60000)
+        time.sleep(random.uniform(5, 8))
+        body = page.inner_text("body").lower()
+        is_in_stock = "out of stock online" not in body
+        
+        if is_in_stock:
+            if not mon["in_stock"]:
+                mon["count"] = 1
+                send_whatsapp(f"🟢 *OWNDAYS STOCK (1/5)* 🟢\nItem is IN STOCK!\n{OWNDAYS_URL}")
+                mon["status"] = "ALERTING: 1/5 reminders sent"
+            elif mon["count"] < 5:
+                mon["count"] += 1
+                send_whatsapp(f"🟢 *OWNDAYS REMINDER ({mon['count']}/5)* 🟢\n{OWNDAYS_URL}")
+                mon["status"] = f"ALERTING: {mon['count']}/5 reminders sent"
+            else:
+                mon["status"] = "PAUSED: 5/5 reminders completed"
+            mon["in_stock"] = True
+        else:
+            mon["in_stock"], mon["count"] = False, 0
+            mon["status"] = "Monitoring: Out of Stock"
+    except Exception as e: mon["status"] = f"ERROR: {str(e)[:50]}"
+    return state
+
+def check_levis(page, state):
+    mon = state["monitors"]["levis"]
+    mon["last_check"] = get_hk_time()
+    try:
+        page.goto(LEVIS_CACHE_URL, timeout=60000)
+        time.sleep(random.uniform(5, 8))
+        content = page.content().lower()
+        sale = next((kw for kw in ["50% off", "60% off", "70% off", "half off"] if kw in content), "")
+        
+        if sale:
+            if mon["sale"] != sale:
+                mon["count"] = 1
+                send_whatsapp(f"🚨 *LEVI'S SALE (1/5)* 🚨\nFound: *{sale.upper()}*")
+                mon["status"] = f"ALERTING: New {sale} found (1/5)"
+            elif mon["count"] < 5:
+                mon["count"] += 1
+                send_whatsapp(f"🚨 *LEVI'S REMINDER ({mon['count']}/5)* 🚨\n*{sale.upper()}* active")
+                mon["status"] = f"ALERTING: {sale} active ({mon['count']}/5)"
+            else:
+                mon["status"] = f"PAUSED: 5/5 reminders for {sale} done"
+            mon["sale"] = sale
+        else:
+            mon["sale"], mon["count"] = "", 0
+            mon["status"] = "Monitoring: No Sale Found"
+    except Exception as e: mon["status"] = f"ERROR: {str(e)[:50]}"
+    return state
+
+def kill_facebook_modals(page):
+    try:
+        close_buttons = page.locator("div[aria-label='Close'], div[role='button']:has-text('Close'), i[data-visualcompletion='css-img']").all()
+        for btn in close_buttons:
+            if btn.is_visible():
+                btn.click()
+                time.sleep(1)
+    except:
+        pass
+
+def check_facebook(page, url, state):
+    base_url = url.rstrip('/')
+    photo_url = base_url + "/photos/"
+    fb_monitors = state["monitors"].setdefault("fb", {})
+    f = fb_monitors.setdefault(url, {"status": "Initializing", "id": "", "last_check": ""})
+    f["last_check"] = get_hk_time()
     
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+    try:
+        page.goto(photo_url, timeout=60000)
+        time.sleep(random.uniform(8, 12))
         
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        kill_facebook_modals(page)
         
-    - name: Install Playwright Browsers & Dependencies
-      run: |
-        sudo apt-get update
-        # Explicitly install modern Ubuntu 24.04 libraries
-        sudo apt-get install -y libasound2t64 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libglib2.0-0 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext1 libxfixes1 libxi6 libxrandr2 libxrender1 libxss1 libxtst6
-        playwright install chromium
-        
-    - name: Restore state file memory (Cache)
-      uses: actions/cache/restore@v4
-      with:
-        path: state.json
-        key: state-memory-${{ github.run_id }}
-        restore-keys: |
-          state-memory-
-          
-    - name: Run monitoring script
-      env:
-        TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-        TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
-        MY_PHONE: ${{ secrets.MY_PHONE }}
-        TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
-        FB_PAGE_1: ${{ secrets.FB_PAGE_1 }}
-        FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
-        FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}
-        STOP_ALERTS: ${{ vars.STOP_ALERTS }}
-      run: python main.py
-      
-    - name: Save state file memory (Cache)
-      uses: actions/cache/save@v4
-      if: always()
-      with:
-        path: state.json
-        key: state-memory-${{ github.run_id }}
+        body_text = page.inner_text("body")
+        if "Log In" in body_text and "Email address or mobile number" in body_text:
+            f["status"] = "Wall Detected: Hard Login Required"
+            log_event(state, f"FB Wall hit on {base_url}")
+            return state
 
-    - name: Upload Visible Report (Artifact)
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: execution-report
-        path: state.json
-        retention-days: 7
+        latest_id = ""
+        photo_links = page.locator("a[href*='/photo/']").all()
+        for link in photo_links:
+            try:
+                href = link.get_attribute("href")
+                if href and "/photo/" in href:
+                    if "fbid=" in href:
+                        latest_id = href.split("fbid=")[1].split("&")[0]
+                    else:
+                        latest_id = href.split("/photo/")[1].split("/")[0]
+                    break
+            except:
+                continue
+        
+        if not latest_id:
+            post_links = page.locator("a[href*='/posts/']").all()
+            for link in post_links:
+                try:
+                    href = link.get_attribute("href")
+                    if href and "/posts/" in href:
+                        latest_id = href.split("/posts/")[1].split("/")[0]
+                        break
+                except:
+                    continue
 
-    - name: Print Report to Console
-      if: always()
-      run: |
-        if [ -f state.json ]; then
-          echo "--- LATEST LOGS ---"
-          cat state.json
-        fi
+        if not latest_id:
+            snippet = body_text.replace('\n', ' ')[:80]
+            f["status"] = f"Idle: No ID found. Body: {snippet}"
+            log_event(state, f"FB No ID found for {base_url}. Snippet: {snippet}")
+            return state
+
+        if f["id"] != latest_id:
+            old_id = f["id"]
+            f["id"] = latest_id
+            send_whatsapp(f"📱 *NEW FB POST* 📱\nPage: {url}")
+            f["status"] = f"NEW POST: Notified ID {latest_id} (Prev: {old_id})"
+            log_event(state, f"FB Alert sent for {url} (New ID: {latest_id})")
+        else:
+            f["status"] = f"Idle: Up to date (ID {latest_id})"
+            
+    except Exception as e: 
+        f["status"] = f"ERROR: {str(e)[:50]}"
+        log_event(state, f"FB Error ({base_url}): {str(e)[:100]}")
+        
+    return state
+
+def main():
+    if os.environ.get("STOP_ALERTS", "false").lower() == "true": return
+    state = load_state()
+    state["system"]["last_run"] = get_hk_time()
+    state["system"]["total_runs"] = state["system"].get("total_runs", 0) + 1
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", viewport={"width": 1920, "height": 1080})
+        page = context.new_page()
+        
+        state = check_owndays(page, state)
+        state = check_levis(page, state)
+        for url in FB_PAGES: 
+            state = check_facebook(page, url, state)
+            
+        browser.close()
+    
+    with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2)
+
+if __name__ == "__main__": main()

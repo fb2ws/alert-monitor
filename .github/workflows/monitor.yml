@@ -30,13 +30,13 @@ jobs:
         sudo apt-get update
         playwright install --with-deps chromium
         
-    - name: Restore state file cache
+    - name: Restore state file memory (Cache)
       uses: actions/cache/restore@v4
       with:
         path: state.json
-        key: state-${{ github.run_id }}
+        key: state-memory-${{ github.run_id }}
         restore-keys: |
-          state-
+          state-memory-
           
     - name: Run monitoring script
       env:
@@ -48,19 +48,25 @@ jobs:
         STOP_ALERTS: ${{ vars.STOP_ALERTS }}
       run: python main.py
       
-    - name: Save state file cache
+    - name: Save state file memory (Cache)
       uses: actions/cache/save@v4
       if: always()
       with:
         path: state.json
-        key: state-${{ github.run_id }}
+        key: state-memory-${{ github.run_id }}
 
-    - name: Print Execution Report
+    - name: Upload Visible Report (Artifact)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: execution-report
+        path: state.json
+        retention-days: 7
+
+    - name: Print Report to Console
       if: always()
       run: |
         if [ -f state.json ]; then
-          echo "--- EXECUTION REPORT ---"
+          echo "--- LATEST LOGS ---"
           cat state.json
-        else
-          echo "No state file found."
         fi

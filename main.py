@@ -46,20 +46,6 @@ def send_email(subject, body):
         print(f"--- EMAIL ERROR: {str(e)} ---")
         return False
 
-def test_email_connection():
-    """
-    DELETE OR COMMENT OUT THIS FUNCTION CALL IN main() AFTER YOU RECEIVE THE TEST EMAIL
-    """
-    print("--- MANUAL EMAIL TEST INITIATED ---")
-    success = send_email(
-        "🛠️ [MANUAL TEST] Alert System Connection",
-        f"If you are reading this, your Gmail SMTP settings are 100% correct!\n\nTime: {get_hk_time()}"
-    )
-    if success:
-        print("TEST SUCCESSFUL! You can now remove the test_email_connection() call from main().")
-    else:
-        print("TEST FAILED. Check your EMAIL_USER and EMAIL_PASS secrets.")
-
 def load_state():
     if os.path.exists(STATE_FILE):
         try: 
@@ -184,11 +170,6 @@ def check_facebook(page, url, state):
 
 def main():
     if os.environ.get("STOP_ALERTS", "false").lower() == "true": return
-    
-    # --- EMAIL TEST START ---
-    # DELETE OR COMMENT OUT THE LINE BELOW AFTER YOU RECEIVE THE TEST EMAIL
-    test_email_connection() 
-    # --- EMAIL TEST END ---
 
     state = load_state()
     state["system"]["last_run"] = get_hk_time()

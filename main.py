@@ -24,6 +24,105 @@ STATE_FILE = "state.json"
 # HK Timezone (UTC+8 )
 HK_TZ = timezone(timedelta(hours=8))
 
+def send_whatsapp_test(msg: str) -> bool:
+    print("\n==================================================")
+    print("           TWILIO WHATSAPP TEST RUNNER            ")
+    print("==================================================")
+
+    # 1. Inspect Environment Variables
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    my_phone = os.environ.get("MY_PHONE")
+    twilio_from = os.environ.get("TWILIO_FROM")
+    content_sid = os.environ.get("TWILIO_CONTENT_SID")
+
+    print("[1/5] Checking Environment Variables...")
+    print(f"  • TWILIO_ACCOUNT_SID: {'✅ Detected (' + account_sid[:6] + '...)' if account_sid else '❌ MISSING'}")
+    print(f"  • TWILIO_AUTH_TOKEN:  {'✅ Detected (' + '*' * 8 + ')' if auth_token else '❌ MISSING'}")
+    print(f"  • MY_PHONE:           {'✅ Detected (' + str(my_phone) + ')' if my_phone else '❌ MISSING'}")
+    print(f"  • TWILIO_FROM:        {'✅ Detected (' + str(twilio_from) + ')' if twilio_from else '❌ MISSING'}")
+    print(f"  • TWILIO_CONTENT_SID: {'ℹ️  Detected (' + content_sid + ')' if content_sid else 'ℹ️  Not set (Using Freeform)'}")
+
+    if not all([account_sid, auth_token, my_phone, twilio_from]):
+        print("\n❌ CRITICAL ERROR: Required environment variables are missing! Aborting test.")
+        return False
+
+    # 2. Format Phone Numbers
+    to_num = my_phone if my_phone.startswith("whatsapp:") else f"whatsapp:{my_phone}"
+    from_num = twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}"
+
+    print("\n[2/5] Formatted Target Destinations...")
+    print(f"  • Sender (From):     {from_num}")
+    print(f"  • Recipient (To):    {to_num}")
+
+    try:
+        # 3. Initialize Twilio Client
+        print("\n[3/5] Initializing Twilio Client...")
+        client = Client(account_sid, auth_token)
+
+        # 4. Active Credential & Account Status Validation (API Call)
+        print("[4/5] Validating Credentials with Twilio API...")
+        account_info = client.api.v2010.accounts(account_sid).fetch()
+        print(f"  • Account Name:   {account_info.friendly_name}")
+        print(f"  • Account Status: {account_info.status.upper()}")
+        print(f"  • Account Type:   {account_info.type.upper()}")
+        print("  ✅ Credentials verified successfully with Twilio!")
+
+        # 5. Dispatch Message
+        print("\n[5/5] Attempting to Send WhatsApp Message...")
+        if content_sid:
+            print("  • Dispatch Mode: Content Template SID")
+            payload = {"1": msg}
+            print(f"  • Variable Payload: {json.dumps(payload)}")
+            
+            message = client.messages.create(
+                from_=from_num,
+                to=to_num,
+                content_sid=content_sid,
+                content_variables=json.dumps(payload)
+            )
+        else:
+            print("  • Dispatch Mode: Direct Freeform Text")
+            print(f"  • Text Body: \"{msg}\"")
+            
+            message = client.messages.create(
+                body=msg,
+                from_=from_num,
+                to=to_num
+            )
+
+        print("\n==================================================")
+        print(" 🎉 MESSAGE SENT SUCCESSFULLY!")
+        print("==================================================")
+        print(f"  • Message SID:  {message.sid}")
+        print(f"  • Status:       {message.status}")
+        print(f"  • Date Created: {message.date_created}")
+        print(f"  • Price/Unit:   {message.price} {message.price_unit}")
+        print("==================================================\n")
+        return True
+
+    except TwilioRestException as e:
+        print("\n==================================================")
+        print(" 🚨 TWILIO REST API ERROR DETECTED")
+        print("==================================================")
+        print(f"  • HTTP Status:  {e.status}")
+        print(f"  • Error Code:   {e.code}")
+        print(f"  • Details:      {e.msg}")
+        if e.code == 20003:
+            print("  💡 Tip: Auth Token or Account SID is invalid.")
+        elif e.code == 63016:
+            print("  💡 Tip: Message failed because recipient is outside the 24h window and no Content Template was used.")
+        print("==================================================\n")
+        return False
+    except Exception as e:
+        print("\n==================================================")
+        print(" ❌ SYSTEM / PYTHON EXCEPTION")
+        print("==================================================")
+        print(f"  • Error Type: {type(e).__name__}")
+        print(f"  • Details:    {str(e)}")
+        print("==================================================\n")
+        return False
+
 def get_hk_time():
     return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -231,4 +330,7 @@ def main():
     print(json.dumps(state, indent=2))
     print("--------------------------\n")
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    # Test execution message
+    test_payload = "🤖 Test Run Alert: Twilio credentials verification active."
+    send_whatsapp_test(test_payload)

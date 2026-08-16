@@ -4,17 +4,16 @@ import time
 import random
 import requests
 import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from playwright.sync_api import sync_playwright
 from datetime import datetime, timezone, timedelta
-from twilio.rest import Client
 
 # --- Configuration ---
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
-TWILIO_FROM = os.environ.get("TWILIO_FROM") # e.g. whatsapp:+17372507786
-TWILIO_CONTENT_SID = os.environ.get("TWILIO_CONTENT_SID") # Your approved Content Template SID
-MY_PHONE = os.environ.get("MY_PHONE") # e.g. whatsapp:+85212345678
-
+EMAIL_USER = os.environ.get("EMAIL_USER")
+EMAIL_PASS = os.environ.get("EMAIL_PASS")
+RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 FB_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_{i}")]
 
 LEVIS_CACHE_URL = "https://webcache.googleusercontent.com/search?q=cache:https://www.levi.com/US/en_US/"
@@ -24,181 +23,28 @@ STATE_FILE = "state.json"
 # HK Timezone (UTC+8 )
 HK_TZ = timezone(timedelta(hours=8))
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"levis": {"sale": "", "count": 0}, "owndays": {"in_stock": False, "count": 0}, "fb": {}}
-
-def send_whatsapp_test(msg: str) -> bool:
-    logs = []
-
-    def log(entry: str):
-        print(entry)
-        logs.append(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] {entry}")
-
-    log("==================================================")
-    log("           TWILIO WHATSAPP TEST RUNNER            ")
-    log("==================================================")
-
-    # 1. Environment Variable Checks
-    log("[1/5] Checking Environment Variables...")
-    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-    my_phone = os.environ.get("MY_PHONE")
-    twilio_from = os.environ.get("TWILIO_FROM")
-    content_sid = os.environ.get("TWILIO_CONTENT_SID")
-
-    log(f"  • TWILIO_ACCOUNT_SID: {'✅ Set (' + account_sid[:6] + '...)' if account_sid else '❌ MISSING'}")
-    log(f"  • TWILIO_AUTH_TOKEN:  {'✅ Set' if auth_token else '❌ MISSING'}")
-    log(f"  • MY_PHONE:           {my_phone if my_phone else '❌ MISSING'}")
-    log(f"  • TWILIO_FROM:        {twilio_from if twilio_from else '❌ MISSING'}")
-    log(f"  • TWILIO_CONTENT_SID: {content_sid if content_sid else 'ℹ️  Not set (Using Freeform)'}")
-
-    success = False
-    metadata = {}
-
-    if not all([account_sid, auth_token, my_phone, twilio_from]):
-        log("❌ CRITICAL ERROR: One or more required environment variables are missing!")
-    else:
-        # 2. Number Formatting
-        log("[2/5] Formatted Target Destinations...")
-        to_num = my_phone if my_phone.startswith("whatsapp:") else f"whatsapp:{my_phone}"
-        from_num = twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}"
-        log(f"  • Sender (From):     {from_num}")
-        log(f"  • Recipient (To):    {to_num}")
-
-        try:
-            # 3. Client Initialization
-            log("[3/5] Initializing Twilio Client...")
-            client = Client(account_sid, auth_token)
-
-            # 4. API Credential Verification
-            log("[4/5] Validating Credentials with Twilio API...")
-            account_info = client.api.v2010.accounts(account_sid).fetch()
-            log(f"  • Account Name:   {account_info.friendly_name}")
-            log(f"  • Account Status: {account_info.status.upper()}")
-            log("  ✅ Credentials verified successfully!")
-
-            # 5. Dispatch Message
-            log("[5/5] Attempting to Send WhatsApp Message...")
-            if content_sid:
-                log("  • Dispatch Mode: Content Template SID")
-                payload = {"1": msg}
-                log(f"  • Variable Payload: {json.dumps(payload)}")
-                res = client.messages.create(
-                    from_=from_num,
-                    to=to_num,
-                    content_sid=content_sid,
-                    content_variables=json.dumps(payload)
-                )
-            else:
-                log("  • Dispatch Mode: Direct Freeform Text")
-                log(f"  • Text Body: \"{msg}\"")
-                res = client.messages.create(body=msg, from_=from_num, to=to_num)
-
-            log("==================================================")
-            log(" 🎉 MESSAGE ACCEPTED BY TWILIO!")
-            log(f"  • Message SID:  {res.sid}")
-            log(f"  • Status:       {res.status}")
-            log("==================================================")
-
-            metadata = {
-                "message_sid": res.sid,
-                "status": res.status,
-                "to": to_num,
-                "from": from_num,
-                "error_code": res.error_code,
-                "error_message": res.error_message
-            }
-            success = True
-
-        except TwilioRestException as e:
-            log("==================================================")
-            log(" 🚨 TWILIO REST API ERROR DETECTED")
-            log(f"  • HTTP Status:  {e.status}")
-            log(f"  • Error Code:   {e.code}")
-            log(f"  • Details:      {e.msg}")
-            log("==================================================")
-            metadata = {"error_code": e.code, "error_msg": e.msg, "http_status": e.status}
-
-        except Exception as e:
-            log("==================================================")
-            log(" ❌ SYSTEM / PYTHON EXCEPTION")
-            log(f"  • Error Type: {type(e).__name__}")
-            log(f"  • Details:    {str(e)}")
-            log("==================================================")
-            metadata = {"error": str(e)}
-
-    # Save execution record and logs to state.json
-    state = load_state()
-    state["last_twilio_run"] = {
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "success": success,
-        "logs": logs,
-        "metadata": metadata
-    }
-
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-    return success
 def get_hk_time():
     return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-def send_whatsapp(msg):
-    # 1. Safely retrieve variables (assuming they are set in your environment)
-    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-    my_phone = os.environ.get("MY_PHONE")
-    twilio_from = os.environ.get("TWILIO_FROM")
-    content_sid = os.environ.get("TWILIO_CONTENT_SID")
-
-    # 2. Check ALL required variables, importantly including the sender number
-    if not all([account_sid, auth_token, my_phone, twilio_from]):
-        print("Twilio credentials or phone numbers missing.")
+def send_email(subject, body):
+    if not (EMAIL_USER and EMAIL_PASS and RECEIVER_EMAIL):
+        print("Email credentials missing.")
         return False
-
     try:
-        # 3. Initialize the Client
-        client = Client(account_sid, auth_token)
-        
-        # Ensure numbers are formatted with the 'whatsapp:' prefix
-        to_num = my_phone if my_phone.startswith("whatsapp:") else f"whatsapp:{my_phone}"
-        from_num = twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}"
-        
-        # 4. Route the message request
-        if content_sid:
-            # Send using an approved Content Template to bypass the 24h rule
-            # NOTE: Your Twilio template MUST have exactly one variable configured as {{1}}
-            message = client.messages.create(
-                from_=from_num,
-                to=to_num,
-                content_sid=content_sid,
-                content_variables=json.dumps({"1": msg}) 
-            )
-        else:
-            # Send a freeform message (Only works if recipient replied in the last 24 hours)
-            message = client.messages.create(
-                body=msg, 
-                from_=from_num, 
-                to=to_num
-            )
-            
-        print(f"Twilio Success! SID: {message.sid}")
-        return True
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_USER
+        msg['To'] = RECEIVER_EMAIL
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
 
-    # 5. Catch Twilio-specific errors to expose the actual API rejection reason
-    except TwilioRestException as e:
-        print(f"--- TWILIO API ERROR ---")
-        print(f"Code: {e.code} | Status: {e.status}")
-        print(f"Message: {e.msg}")
-        return False
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.sendmail(EMAIL_USER, RECEIVER_EMAIL, msg.as_string())
+            
+        print(f"Email Success! Sent to {RECEIVER_EMAIL}")
+        return True
     except Exception as e:
-        print(f"--- GENERAL ERROR ---")
+        print(f"--- EMAIL ERROR ---")
         print(f"Error: {str(e)}")
         return False
 
@@ -231,12 +77,18 @@ def check_owndays(page, state):
         if is_in_stock:
             if not mon["in_stock"]:
                 mon["count"] = 1
-                success = send_whatsapp(f"🟢 OWNDAYS STOCK (1/5): Item is IN STOCK! {OWNDAYS_URL}")
-                mon["status"] = "ALERTING: 1/5 reminders sent" if success else "ERROR: Twilio failed"
+                success = send_email(
+                    "🟢 [ALERT] Owndays Glasses IN STOCK (1/5)",
+                    f"Item is currently IN STOCK online!\n\nLink:\n{OWNDAYS_URL}\n\nTime: {get_hk_time()}"
+                )
+                mon["status"] = "ALERTING: 1/5 reminders sent" if success else "ERROR: Email failed"
             elif mon["count"] < 5:
                 mon["count"] += 1
-                success = send_whatsapp(f"🟢 OWNDAYS REMINDER ({mon['count']}/5): {OWNDAYS_URL}")
-                mon["status"] = f"ALERTING: {mon['count']}/5 reminders sent" if success else "ERROR: Twilio failed"
+                success = send_email(
+                    f"🟢 [REMINDER] Owndays Glasses IN STOCK ({mon['count']}/5)",
+                    f"Reminder: Item is still IN STOCK online!\n\nLink:\n{OWNDAYS_URL}\n\nTime: {get_hk_time()}"
+                )
+                mon["status"] = f"ALERTING: {mon['count']}/5 reminders sent" if success else "ERROR: Email failed"
             else:
                 mon["status"] = "PAUSED: 5/5 reminders completed"
             mon["in_stock"] = True
@@ -258,12 +110,18 @@ def check_levis(page, state):
         if sale:
             if mon["sale"] != sale:
                 mon["count"] = 1
-                success = send_whatsapp(f"🚨 LEVI'S SALE (1/5): Found {sale.upper()}!")
-                mon["status"] = f"ALERTING: New {sale} found (1/5)" if success else "ERROR: Twilio failed"
+                success = send_email(
+                    f"🚨 [ALERT] Levi's Sale Found: {sale.upper()} (1/5)",
+                    f"Levi's US Sale detected: {sale.upper()}!\n\nSearch Page:\nhttps://www.levi.com/US/en_US/search/polo/facets/feature-gender/men/sort/price-asc\n\nTime: {get_hk_time( )}"
+                )
+                mon["status"] = f"ALERTING: New {sale} found (1/5)" if success else "ERROR: Email failed"
             elif mon["count"] < 5:
                 mon["count"] += 1
-                success = send_whatsapp(f"🚨 LEVI'S REMINDER ({mon['count']}/5): {sale.upper()} active")
-                mon["status"] = f"ALERTING: {sale} active ({mon['count']}/5)" if success else "ERROR: Twilio failed"
+                success = send_email(
+                    f"🚨 [REMINDER] Levi's Sale: {sale.upper()} ({mon['count']}/5)",
+                    f"Reminder: Levi's {sale.upper()} sale is still active!\n\nTime: {get_hk_time()}"
+                )
+                mon["status"] = f"ALERTING: {sale} active ({mon['count']}/5)" if success else "ERROR: Email failed"
             else:
                 mon["status"] = f"PAUSED: 5/5 reminders for {sale} done"
             mon["sale"] = sale
@@ -308,7 +166,7 @@ def check_facebook(page, url, state):
 
         cleaned = raw_text.replace("See more", "")
         cleaned = re.sub(r"(All reactions:.*|Like\s+Comment.*|View more.*|\d+[dhms]\s+\u00b7)", "", cleaned, flags=re.IGNORECASE)
-        final_text = ' '.join(cleaned.split()).strip()[:600]
+        final_text = ' '.join(cleaned.split()).strip()[:800]
         
         if len(final_text) < 5:
             f["status"] = "Idle: Content too short"
@@ -316,12 +174,15 @@ def check_facebook(page, url, state):
 
         if f.get("last_post_text") != final_text:
             f["last_post_text"] = final_text
-            msg = f"📱 NEW FB POST on {url.split('/')[-1]}:\n\n{final_text}"
-            success = send_whatsapp(msg)
+            page_name = url.split('/')[-1] or url.split('/')[-2]
+            subject = f"📱 NEW FB POST: {page_name}"
+            body = f"New post detected on Facebook page:\n{url}\n\nContent:\n{final_text}\n\nTime: {get_hk_time()}"
+            
+            success = send_email(subject, body)
             if success:
                 f["status"] = f"NOTIFIED: {final_text[:30]}..."
             else:
-                f["status"] = "ERROR: Twilio failed"
+                f["status"] = "ERROR: Email failed"
         else:
             f["status"] = f"Idle: Up to date"
             
@@ -353,5 +214,4 @@ def main():
     print(json.dumps(state, indent=2))
     print("--------------------------\n")
 
-if __name__ == "__main__":
-    send_whatsapp_test("🤖 Test Run Alert: Twilio credentials verification active.")
+if __name__ == "__main__": main()

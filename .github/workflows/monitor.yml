@@ -34,7 +34,7 @@ jobs:
       uses: actions/cache/restore@v4
       with:
         path: state.json
-        key: state-memory-${{ github.run_id }}
+        key: state-memory-1-${{ github.run_id }}
         restore-keys: |
           state-memory-
           
@@ -54,7 +54,7 @@ jobs:
       if: always()
       with:
         path: state.json
-        key: state-memory-${{ github.run_id }}
+        key: state-memory-1-${{ github.run_id }}
 
     - name: Upload Visible Report (Artifact)
       if: always()

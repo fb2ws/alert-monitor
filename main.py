@@ -40,13 +40,25 @@ def send_email(subject, body):
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(EMAIL_USER, EMAIL_PASS)
             server.sendmail(EMAIL_USER, RECEIVER_EMAIL, msg.as_string())
-            
         print(f"Email Success! Sent to {RECEIVER_EMAIL}")
         return True
     except Exception as e:
-        print(f"--- EMAIL ERROR ---")
-        print(f"Error: {str(e)}")
+        print(f"--- EMAIL ERROR: {str(e)} ---")
         return False
+
+def test_email_connection():
+    """
+    DELETE OR COMMENT OUT THIS FUNCTION CALL IN main() AFTER YOU RECEIVE THE TEST EMAIL
+    """
+    print("--- MANUAL EMAIL TEST INITIATED ---")
+    success = send_email(
+        "🛠️ [MANUAL TEST] Alert System Connection",
+        f"If you are reading this, your Gmail SMTP settings are 100% correct!\n\nTime: {get_hk_time()}"
+    )
+    if success:
+        print("TEST SUCCESSFUL! You can now remove the test_email_connection() call from main().")
+    else:
+        print("TEST FAILED. Check your EMAIL_USER and EMAIL_PASS secrets.")
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -77,17 +89,11 @@ def check_owndays(page, state):
         if is_in_stock:
             if not mon["in_stock"]:
                 mon["count"] = 1
-                success = send_email(
-                    "🟢 [ALERT] Owndays Glasses IN STOCK (1/5)",
-                    f"Item is currently IN STOCK online!\n\nLink:\n{OWNDAYS_URL}\n\nTime: {get_hk_time()}"
-                )
+                success = send_email("🟢 [ALERT] Owndays Glasses IN STOCK (1/5)", f"Item is IN STOCK!\n{OWNDAYS_URL}")
                 mon["status"] = "ALERTING: 1/5 reminders sent" if success else "ERROR: Email failed"
             elif mon["count"] < 5:
                 mon["count"] += 1
-                success = send_email(
-                    f"🟢 [REMINDER] Owndays Glasses IN STOCK ({mon['count']}/5)",
-                    f"Reminder: Item is still IN STOCK online!\n\nLink:\n{OWNDAYS_URL}\n\nTime: {get_hk_time()}"
-                )
+                success = send_email(f"🟢 [REMINDER] Owndays Glasses IN STOCK ({mon['count']}/5)", f"Item is still IN STOCK!\n{OWNDAYS_URL}")
                 mon["status"] = f"ALERTING: {mon['count']}/5 reminders sent" if success else "ERROR: Email failed"
             else:
                 mon["status"] = "PAUSED: 5/5 reminders completed"
@@ -110,17 +116,11 @@ def check_levis(page, state):
         if sale:
             if mon["sale"] != sale:
                 mon["count"] = 1
-                success = send_email(
-                    f"🚨 [ALERT] Levi's Sale Found: {sale.upper()} (1/5)",
-                    f"Levi's US Sale detected: {sale.upper()}!\n\nSearch Page:\nhttps://www.levi.com/US/en_US/search/polo/facets/feature-gender/men/sort/price-asc\n\nTime: {get_hk_time( )}"
-                )
+                success = send_email(f"🚨 [ALERT] Levi's Sale Found: {sale.upper()} (1/5)", f"Sale detected: {sale.upper()}!\nTime: {get_hk_time()}")
                 mon["status"] = f"ALERTING: New {sale} found (1/5)" if success else "ERROR: Email failed"
             elif mon["count"] < 5:
                 mon["count"] += 1
-                success = send_email(
-                    f"🚨 [REMINDER] Levi's Sale: {sale.upper()} ({mon['count']}/5)",
-                    f"Reminder: Levi's {sale.upper()} sale is still active!\n\nTime: {get_hk_time()}"
-                )
+                success = send_email(f"🚨 [REMINDER] Levi's Sale: {sale.upper()} ({mon['count']}/5)", f"Levi's {sale.upper()} sale is still active!")
                 mon["status"] = f"ALERTING: {sale} active ({mon['count']}/5)" if success else "ERROR: Email failed"
             else:
                 mon["status"] = f"PAUSED: 5/5 reminders for {sale} done"
@@ -131,16 +131,6 @@ def check_levis(page, state):
     except Exception as e: mon["status"] = f"ERROR: {str(e)[:50]}"
     return state
 
-def kill_facebook_modals(page):
-    try:
-        close_buttons = page.locator("div[aria-label='Close'], div[role='button']:has-text('Close')").all()
-        for btn in close_buttons:
-            if btn.is_visible():
-                btn.click()
-                time.sleep(1)
-    except:
-        pass
-
 def check_facebook(page, url, state):
     base_url = url.rstrip('/')
     fb_monitors = state["monitors"].setdefault("fb", {})
@@ -150,23 +140,25 @@ def check_facebook(page, url, state):
     try:
         page.goto(base_url, timeout=60000)
         time.sleep(random.uniform(8, 12))
-        kill_facebook_modals(page)
         
-        post_container = page.locator("div[data-ad-comet-preview='message']").first
+        # Look for the first post container
+        post_container = page.locator("div[data-ad-comet-preview='message'], div[role='article']").first
         raw_text = ""
+        
         if post_container.is_visible():
+            # Strategy: Grab content from div[dir="auto"] inside the message container
+            # This is the cleanest way to avoid dates, likes, and comments
             text_blocks = post_container.locator("div[dir='auto']").all_inner_texts()
-            raw_text = " ".join(text_blocks)
-        else:
-            raw_text = page.locator("div[role='article']").first.inner_text()
+            raw_text = " ".join([t.strip() for t in text_blocks if t.strip()])
 
         if not raw_text:
-            f["status"] = "Idle: No post content"
+            f["status"] = "Idle: No post content found"
             return state
 
-        cleaned = raw_text.replace("See more", "")
+        # Clean UI noise like "See more", reaction counts, and timestamps
+        cleaned = raw_text.replace("See more", "").replace("See More", "")
         cleaned = re.sub(r"(All reactions:.*|Like\s+Comment.*|View more.*|\d+[dhms]\s+\u00b7)", "", cleaned, flags=re.IGNORECASE)
-        final_text = ' '.join(cleaned.split()).strip()[:800]
+        final_text = ' '.join(cleaned.split()).strip()[:900]
         
         if len(final_text) < 5:
             f["status"] = "Idle: Content too short"
@@ -184,7 +176,7 @@ def check_facebook(page, url, state):
             else:
                 f["status"] = "ERROR: Email failed"
         else:
-            f["status"] = f"Idle: Up to date"
+            f["status"] = "Idle: Up to date"
             
     except Exception as e: 
         f["status"] = f"ERROR: {str(e)[:50]}"
@@ -192,6 +184,12 @@ def check_facebook(page, url, state):
 
 def main():
     if os.environ.get("STOP_ALERTS", "false").lower() == "true": return
+    
+    # --- EMAIL TEST START ---
+    # DELETE OR COMMENT OUT THE LINE BELOW AFTER YOU RECEIVE THE TEST EMAIL
+    test_email_connection() 
+    # --- EMAIL TEST END ---
+
     state = load_state()
     state["system"]["last_run"] = get_hk_time()
     state["system"]["total_runs"] = state["system"].get("total_runs", 0) + 1

@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [trigger_monitor]
-  push:
-    branches: [ "main", "master" ]
 
 concurrency:
   group: alert-monitor-single-run

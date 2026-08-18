@@ -1,196 +1,529 @@
-import os
 import json
-import time
+import os
 import random
-import requests
 import re
 import smtplib
-from email.mime.text import MIMEText
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
-from playwright.sync_api import sync_playwright
-from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
 
-# --- Configuration ---
+from playwright.sync_api import sync_playwright
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
-FB_PAGES = [os.environ.get(f"FB_PAGE_{i}") for i in range(1, 4) if os.environ.get(f"FB_PAGE_{i}")]
+FB_PAGES = [
+    os.environ.get(f"FB_PAGE_{number}")
+    for number in range(1, 4)
+    if os.environ.get(f"FB_PAGE_{number}")
+]
 
-LEVIS_CACHE_URL = "https://webcache.googleusercontent.com/search?q=cache:https://www.levi.com/US/en_US/"
+LEVIS_URL = (
+    "https://www.levi.com/US/en_US/clothing/men/shirts/"
+    "housemark-polo-shirt/p/358830292"
+)
 OWNDAYS_URL = "https://www.owndays.com/jp/en/products/SENICHI31?sku=6259"
 STATE_FILE = "state.json"
 
-# HK Timezone (UTC+8 )
 HK_TZ = timezone(timedelta(hours=8))
+BLOCK_MARKERS = (
+    "captcha",
+    "verify you are human",
+    "access denied",
+    "temporarily blocked",
+    "unusual traffic",
+    "security check",
+    "please enable javascript",
+)
 
+
+# -----------------------------------------------------------------------------
+# General utilities
+# -----------------------------------------------------------------------------
 def get_hk_time():
-    return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    """Return an unambiguous Hong Kong local timestamp (UTC+8)."""
+    return datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M:%S HK")
+
+
+def shorten(text, limit=240):
+    """Normalize whitespace and return a readable, bounded diagnostic string."""
+    return " ".join((text or "").split())[:limit]
+
+
+def log_event(state, category, message):
+    """Print a log entry now and retain the last 100 entries in state.json."""
+    entry = f"[{get_hk_time()}] [{category}] {message}"
+    print(entry, flush=True)
+    state.setdefault("history", []).append(entry)
+    state["history"] = state["history"][-100:]
+
 
 def send_email(subject, body):
+    """Send one UTF-8 Gmail SMTP email and return success/failure."""
     if not (EMAIL_USER and EMAIL_PASS and RECEIVER_EMAIL):
-        print("Email credentials missing.")
+        print("[EMAIL] Credentials are missing: check EMAIL_USER, EMAIL_PASS, RECEIVER_EMAIL.", flush=True)
         return False
-    try:
-        msg = MIMEMultipart()
-        msg['Subject'] = subject
-        msg['From'] = EMAIL_USER
-        msg['To'] = RECEIVER_EMAIL
-        msg.attach(MIMEText(body, 'plain', 'utf-8'))
 
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+    try:
+        message = MIMEMultipart()
+        message["Subject"] = subject
+        message["From"] = EMAIL_USER
+        message["To"] = RECEIVER_EMAIL
+        message.attach(MIMEText(body, "plain", "utf-8"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
             server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(EMAIL_USER, RECEIVER_EMAIL, msg.as_string())
-        print(f"Email Success! Sent to {RECEIVER_EMAIL}")
+            server.sendmail(EMAIL_USER, [RECEIVER_EMAIL], message.as_string())
+
+        print(f"[EMAIL] Sent successfully to {RECEIVER_EMAIL}: {subject}", flush=True)
         return True
-    except Exception as e:
-        print(f"--- EMAIL ERROR: {str(e)} ---")
+    except Exception as exc:
+        print(f"[EMAIL] FAILED: {type(exc).__name__}: {exc}", flush=True)
         return False
+
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try: 
-            with open(STATE_FILE, "r") as f:
-                data = json.load(f)
-                if "monitors" in data: return data
-        except: pass
-    return {
-        "system": {"last_run": "", "total_runs": 0},
-        "monitors": {
-            "levis": {"status": "Initializing", "sale": "", "count": 0, "last_check": ""},
-            "owndays": {"status": "Initializing", "in_stock": False, "count": 0, "last_check": ""},
-            "fb": {}
+    """Load state.json and migrate older state formats without losing monitoring state."""
+    default_state = {
+        "system": {
+            "last_run": "",
+            "total_runs": 0,
+            "timezone": "Asia/Hong_Kong (UTC+8)",
         },
-        "history": []
+        "monitors": {
+            "levis": {},
+            "owndays": {},
+            "fb": {},
+        },
+        "history": [],
     }
 
-def check_owndays(page, state):
-    mon = state["monitors"]["owndays"]
-    mon["last_check"] = get_hk_time()
     try:
-        page.goto(OWNDAYS_URL, timeout=60000)
-        time.sleep(random.uniform(5, 8))
-        body = page.inner_text("body").lower()
-        is_in_stock = "out of stock online" not in body
-        
-        if is_in_stock:
-            if not mon["in_stock"]:
-                mon["count"] = 1
-                success = send_email("🟢 [ALERT] Owndays Glasses IN STOCK (1/5)", f"Item is IN STOCK!\n{OWNDAYS_URL}")
-                mon["status"] = "ALERTING: 1/5 reminders sent" if success else "ERROR: Email failed"
-            elif mon["count"] < 5:
-                mon["count"] += 1
-                success = send_email(f"🟢 [REMINDER] Owndays Glasses IN STOCK ({mon['count']}/5)", f"Item is still IN STOCK!\n{OWNDAYS_URL}")
-                mon["status"] = f"ALERTING: {mon['count']}/5 reminders sent" if success else "ERROR: Email failed"
-            else:
-                mon["status"] = "PAUSED: 5/5 reminders completed"
-            mon["in_stock"] = True
-        else:
-            mon["in_stock"], mon["count"] = False, 0
-            mon["status"] = "Monitoring: Out of Stock"
-    except Exception as e: mon["status"] = f"ERROR: {str(e)[:50]}"
+        with open(STATE_FILE, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        state = default_state
+
+    state.setdefault("system", {})
+    state.setdefault("monitors", {})
+    state.setdefault("history", [])
+    state["monitors"].setdefault("levis", {})
+    state["monitors"].setdefault("owndays", {})
+    state["monitors"].setdefault("fb", {})
+    state["system"].setdefault("total_runs", 0)
+    state["system"]["timezone"] = "Asia/Hong_Kong (UTC+8)"
     return state
 
-def check_levis(page, state):
-    mon = state["monitors"]["levis"]
-    mon["last_check"] = get_hk_time()
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, ensure_ascii=False, indent=2)
+
+
+def update_fetch_details(monitor, response, page, visible_text, url):
+    """Store common, human-readable diagnostics for every successful page read."""
+    monitor["fetch"] = {
+        "when": get_hk_time(),
+        "url": url,
+        "http_status": response.status if response else None,
+        "page_title": shorten(page.title(), 160),
+        "visible_text_length": len(visible_text),
+        "visible_text_sample": shorten(visible_text, 260),
+    }
+
+
+def page_looks_blocked(page, visible_text):
+    """Conservatively identify access/CAPTCHA pages; this does not attempt to bypass them."""
+    lower_text = (visible_text or "").lower()
+    if any(marker in lower_text for marker in BLOCK_MARKERS):
+        return True
+
     try:
-        page.goto(LEVIS_CACHE_URL, timeout=60000)
-        time.sleep(random.uniform(5, 8))
-        content = page.content().lower()
-        sale = next((kw for kw in ["50% off", "60% off", "70% off", "half off"] if kw in content), "")
-        
-        if sale:
-            if mon["sale"] != sale:
-                mon["count"] = 1
-                success = send_email(f"🚨 [ALERT] Levi's Sale Found: {sale.upper()} (1/5)", f"Sale detected: {sale.upper()}!\nTime: {get_hk_time()}")
-                mon["status"] = f"ALERTING: New {sale} found (1/5)" if success else "ERROR: Email failed"
-            elif mon["count"] < 5:
-                mon["count"] += 1
-                success = send_email(f"🚨 [REMINDER] Levi's Sale: {sale.upper()} ({mon['count']}/5)", f"Levi's {sale.upper()} sale is still active!")
-                mon["status"] = f"ALERTING: {sale} active ({mon['count']}/5)" if success else "ERROR: Email failed"
-            else:
-                mon["status"] = f"PAUSED: 5/5 reminders for {sale} done"
-            mon["sale"] = sale
+        challenge = page.locator(
+            "iframe[src*='captcha'], iframe[title*='challenge' i], "
+            "input[name='cf-turnstile-response'], [id*='captcha' i]"
+        )
+        return challenge.count() > 0
+    except Exception:
+        return False
+
+
+def configure_lightweight_page(page):
+    """Avoid loading only nonessential heavy assets on a dedicated product/site page."""
+    def handle_route(route):
+        if route.request.resource_type in {"image", "media", "font"}:
+            route.abort()
         else:
-            mon["sale"], mon["count"] = "", 0
-            mon["status"] = "Monitoring: No Sale Found"
-    except Exception as e: mon["status"] = f"ERROR: {str(e)[:50]}"
+            route.continue_()
+
+    page.route("**/*", handle_route)
+
+
+# -----------------------------------------------------------------------------
+# Owndays: stock monitoring with auditable fetch diagnostics
+# -----------------------------------------------------------------------------
+def check_owndays(page, state):
+    """Monitor the exact form#cart-add button state for SKU 6259 availability."""
+    monitor = state["monitors"]["owndays"]
+    monitor.setdefault("in_stock", False)
+    monitor.setdefault("count", 0)
+    monitor.setdefault("status", "Initializing")
+    # Remove evidence fields from prior phrase-only versions of this monitor.
+    monitor.pop("stock_phrase_found", None)
+    monitor["last_check"] = get_hk_time()
+
+    try:
+        response = page.goto(OWNDAYS_URL, timeout=60000, wait_until="domcontentloaded")
+        page.wait_for_timeout(random.randint(4500, 7000))
+        visible_text = page.locator("body").inner_text(timeout=15000)
+        normalized_text = shorten(visible_text, 100000)
+        update_fetch_details(monitor, response, page, normalized_text, OWNDAYS_URL)
+
+        if page_looks_blocked(page, normalized_text):
+            monitor["status"] = "BLOCKED: Owndays showed a CAPTCHA/access check; prior stock state preserved"
+            log_event(state, "OWNDAYS", monitor["status"])
+            return state
+
+        if len(normalized_text) < 100:
+            monitor["status"] = "UNVERIFIED: Too little visible text; prior stock state preserved"
+            log_event(state, "OWNDAYS", monitor["status"])
+            return state
+
+        cart_button = page.locator("form#cart-add button").first
+        if cart_button.count() == 0:
+            monitor["status"] = "UNVERIFIED: form#cart-add button was not found; prior stock state preserved"
+            monitor["cart_button"] = {"found": False}
+            log_event(state, "OWNDAYS", monitor["status"])
+            return state
+
+        button_text = shorten(cart_button.inner_text(timeout=10000), 160)
+        is_disabled = cart_button.is_disabled(timeout=10000)
+        monitor["cart_button"] = {
+            "found": True,
+            "text": button_text,
+            "disabled": is_disabled,
+            "selector": "form#cart-add button",
+        }
+        monitor["stock_evidence"] = button_text
+
+        # The exact condition requested: the item is unavailable when this button is
+        # disabled or displays the exact out-of-stock message.
+        is_out_of_stock = is_disabled or button_text.casefold() == "out of stock online"
+        if is_out_of_stock:
+            monitor["in_stock"] = False
+            monitor["count"] = 0
+            monitor["status"] = "OK: Fetch succeeded; cart-add button is unavailable / Out Of Stock Online"
+            log_event(
+                state,
+                "OWNDAYS",
+                f"Fetch OK (HTTP {monitor['fetch']['http_status']}); cart button text='{button_text}', disabled={is_disabled}.",
+            )
+            return state
+
+        log_event(
+            state,
+            "OWNDAYS",
+            f"Fetch OK (HTTP {monitor['fetch']['http_status']}); cart button text='{button_text}', disabled={is_disabled}; availability condition met.",
+        )
+
+        if not monitor["in_stock"]:
+            success = send_email(
+                "[ALERT] Owndays Item Appears Available (1/5)",
+                "The requested Owndays cart button condition indicates availability.\n\n"
+                f"Product: {OWNDAYS_URL}\n"
+                f"Button selector: form#cart-add button\n"
+                f"Button text: {button_text}\n"
+                f"Button disabled: {is_disabled}\n"
+                f"Page title: {monitor['fetch']['page_title']}\n\n"
+                f"Checked: {get_hk_time()}",
+            )
+            if success:
+                monitor["in_stock"] = True
+                monitor["count"] = 1
+                monitor["status"] = "ALERTING: Cart button indicates availability; email 1/5 sent"
+                log_event(state, "OWNDAYS", "Availability alert email 1/5 sent.")
+            else:
+                monitor["status"] = "EMAIL FAILED: Availability condition detected; will retry next run"
+                log_event(state, "OWNDAYS", "Availability condition detected but email failed; state not advanced.")
+
+        elif monitor["count"] < 5:
+            reminder_number = monitor["count"] + 1
+            success = send_email(
+                f"[REMINDER] Owndays Item Appears Available ({reminder_number}/5)",
+                "The requested Owndays cart button condition still indicates availability.\n\n"
+                f"Product: {OWNDAYS_URL}\n"
+                f"Button text: {button_text}\n"
+                f"Button disabled: {is_disabled}\n\n"
+                f"Checked: {get_hk_time()}",
+            )
+            if success:
+                monitor["count"] = reminder_number
+                monitor["status"] = f"ALERTING: Availability persists; email {reminder_number}/5 sent"
+                log_event(state, "OWNDAYS", f"Availability reminder email {reminder_number}/5 sent.")
+            else:
+                monitor["status"] = "EMAIL FAILED: Availability persists; will retry current reminder"
+                log_event(state, "OWNDAYS", "Availability reminder email failed; counter not advanced.")
+
+        else:
+            monitor["status"] = "PAUSED: Availability persists; 5/5 email reminders already sent"
+            log_event(state, "OWNDAYS", "Availability remains positive; reminder cap reached.")
+
+    except Exception as exc:
+        monitor["status"] = f"ERROR: Owndays fetch/check failed; prior state preserved ({str(exc)[:120]})"
+        log_event(state, "OWNDAYS", monitor["status"])
+
     return state
+
+
+# -----------------------------------------------------------------------------
+# Levi's: live page, rendered text only, CAPTCHA-safe state handling
+# -----------------------------------------------------------------------------
+def check_levis(page, state):
+    """Alert only when the exact checkout promotion is rendered on the product page."""
+    monitor = state["monitors"]["levis"]
+    monitor.setdefault("sale", "")
+    monitor.setdefault("count", 0)
+    monitor.setdefault("status", "Initializing")
+    # Remove legacy price-calculation fields so state.json reflects the exact
+    # checkout-promotion rule only.
+    for legacy_key in ("sale_price_usd", "original_price_usd", "discount_percent", "sale_evidence"):
+        monitor.pop(legacy_key, None)
+    monitor["last_check"] = get_hk_time()
+
+    promotion = "Extra 50% Off Applied at Checkout"
+
+    try:
+        response = page.goto(LEVIS_URL, timeout=60000, wait_until="domcontentloaded")
+        page.wait_for_timeout(random.randint(4000, 7000))
+        visible_text = page.locator("body").inner_text(timeout=15000)
+        normalized_text = shorten(visible_text, 100000)
+        update_fetch_details(monitor, response, page, normalized_text, LEVIS_URL)
+
+        if page_looks_blocked(page, normalized_text):
+            monitor["status"] = "BLOCKED: Levi's showed a CAPTCHA/access check; prior promotion state preserved"
+            monitor["promotion_evidence"] = monitor["fetch"]["visible_text_sample"]
+            log_event(state, "LEVIS", monitor["status"])
+            return state
+
+        if len(normalized_text) < 250:
+            monitor["status"] = "UNVERIFIED: Too little visible text; prior promotion state preserved"
+            monitor["promotion_evidence"] = monitor["fetch"]["visible_text_sample"]
+            log_event(state, "LEVIS", monitor["status"])
+            return state
+
+        promotion_match = re.search(re.escape(promotion), normalized_text, re.IGNORECASE)
+        if not promotion_match:
+            monitor["sale"] = ""
+            monitor["count"] = 0
+            monitor["promotion_evidence"] = monitor["fetch"]["visible_text_sample"]
+            monitor["status"] = "OK: Fetch succeeded; exact checkout promotion not visible"
+            log_event(
+                state,
+                "LEVIS",
+                f"Fetch OK (HTTP {monitor['fetch']['http_status']}); exact promotion not visible.",
+            )
+            return state
+
+        evidence_start = max(0, promotion_match.start() - 100)
+        evidence_end = min(len(normalized_text), promotion_match.end() + 180)
+        evidence = normalized_text[evidence_start:evidence_end]
+        monitor["promotion_evidence"] = evidence
+        monitor["promotion_text"] = promotion
+        log_event(
+            state,
+            "LEVIS",
+            f"Fetch OK (HTTP {monitor['fetch']['http_status']}); exact checkout promotion is visible.",
+        )
+
+        if monitor["sale"] != promotion:
+            success = send_email(
+                "[ALERT] Levi's: Extra 50% Off at Checkout (1/5)",
+                "The exact requested Levi's promotion is visible.\n\n"
+                f"Promotion: {promotion}\n"
+                f"Visible-text evidence: {evidence}\n\n"
+                f"Product: {LEVIS_URL}\n"
+                f"Checked: {get_hk_time()}",
+            )
+            if success:
+                monitor["sale"] = promotion
+                monitor["count"] = 1
+                monitor["status"] = "ALERTING: Exact promotion visible; email 1/5 sent"
+                log_event(state, "LEVIS", "Promotion alert email 1/5 sent.")
+            else:
+                monitor["status"] = "EMAIL FAILED: Exact promotion visible; will retry next run"
+                log_event(state, "LEVIS", "Promotion detected but email failed; state not advanced.")
+
+        elif monitor["count"] < 5:
+            reminder_number = monitor["count"] + 1
+            success = send_email(
+                f"[REMINDER] Levi's: Extra 50% Off at Checkout ({reminder_number}/5)",
+                "The exact requested Levi's promotion is still visible.\n\n"
+                f"Promotion: {promotion}\n"
+                f"Visible-text evidence: {evidence}\n\n"
+                f"Product: {LEVIS_URL}\n"
+                f"Checked: {get_hk_time()}",
+            )
+            if success:
+                monitor["count"] = reminder_number
+                monitor["status"] = f"ALERTING: Exact promotion persists; email {reminder_number}/5 sent"
+                log_event(state, "LEVIS", f"Promotion reminder email {reminder_number}/5 sent.")
+            else:
+                monitor["status"] = "EMAIL FAILED: Exact promotion persists; will retry current reminder"
+                log_event(state, "LEVIS", "Promotion reminder email failed; counter not advanced.")
+
+        else:
+            monitor["status"] = "PAUSED: Exact promotion remains visible; 5/5 email reminders already sent"
+            log_event(state, "LEVIS", "Promotion remains visible; reminder cap reached.")
+
+    except Exception as exc:
+        monitor["status"] = f"ERROR: Levi's fetch/check failed; prior state preserved ({str(exc)[:120]})"
+        log_event(state, "LEVIS", monitor["status"])
+
+    return state
+
+
+# -----------------------------------------------------------------------------
+# Facebook: compare only clean post content and email once per new post
+# -----------------------------------------------------------------------------
+def clean_facebook_post_text(raw_text):
+    text = raw_text.replace("See more", "").replace("See More", "")
+    text = re.sub(r"All reactions:.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\bLike\s+Comment\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\bView more(?: comments| replies)?\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    return shorten(text, 900)
+
 
 def check_facebook(page, url, state):
-    base_url = url.rstrip('/')
-    fb_monitors = state["monitors"].setdefault("fb", {})
-    f = fb_monitors.setdefault(url, {"status": "Init", "last_post_text": "", "last_check": ""})
-    f["last_check"] = get_hk_time()
-    
+    base_url = url.rstrip("/")
+    monitors = state["monitors"].setdefault("fb", {})
+    monitor = monitors.setdefault(
+        url,
+        {"status": "Initializing", "last_post_text": "", "last_check": ""},
+    )
+    # Remove legacy photo-ID data so it cannot be mistaken for current logic.
+    monitor.pop("id", None)
+    monitor["last_check"] = get_hk_time()
+
     try:
-        page.goto(base_url, timeout=60000)
-        time.sleep(random.uniform(8, 12))
-        
-        # Look for the first post container
-        post_container = page.locator("div[data-ad-comet-preview='message'], div[role='article']").first
+        response = page.goto(base_url, timeout=60000, wait_until="domcontentloaded")
+        page.wait_for_timeout(random.randint(8000, 12000))
+
+        post_container = page.locator("div[data-ad-comet-preview='message']").first
         raw_text = ""
-        
         if post_container.is_visible():
-            # Strategy: Grab content from div[dir="auto"] inside the message container
-            # This is the cleanest way to avoid dates, likes, and comments
+            # This directly targets the content elements identified by the user.
             text_blocks = post_container.locator("div[dir='auto']").all_inner_texts()
-            raw_text = " ".join([t.strip() for t in text_blocks if t.strip()])
+            raw_text = " ".join(block.strip() for block in text_blocks if block.strip())
 
         if not raw_text:
-            f["status"] = "Idle: No post content found"
+            article = page.locator("div[role='article']").first
+            if article.is_visible():
+                text_blocks = article.locator("div[dir='auto']").all_inner_texts()
+                raw_text = " ".join(block.strip() for block in text_blocks if block.strip())
+
+        visible_text = page.locator("body").inner_text(timeout=15000)
+        update_fetch_details(monitor, response, page, visible_text, base_url)
+
+        if not raw_text:
+            monitor["status"] = "UNVERIFIED: No clean div[dir='auto'] post text found; prior post state preserved"
+            log_event(state, "FACEBOOK", f"No clean latest-post text found for {base_url}.")
             return state
 
-        # Clean UI noise like "See more", reaction counts, and timestamps
-        cleaned = raw_text.replace("See more", "").replace("See More", "")
-        cleaned = re.sub(r"(All reactions:.*|Like\s+Comment.*|View more.*|\d+[dhms]\s+\u00b7)", "", cleaned, flags=re.IGNORECASE)
-        final_text = ' '.join(cleaned.split()).strip()[:900]
-        
+        final_text = clean_facebook_post_text(raw_text)
+        monitor["candidate_post_text"] = final_text
         if len(final_text) < 5:
-            f["status"] = "Idle: Content too short"
+            monitor["status"] = "UNVERIFIED: Extracted post text was too short; prior post state preserved"
+            log_event(state, "FACEBOOK", f"Post content too short for {base_url}.")
             return state
 
-        if f.get("last_post_text") != final_text:
-            f["last_post_text"] = final_text
-            page_name = url.split('/')[-1] or url.split('/')[-2]
-            subject = f"📱 NEW FB POST: {page_name}"
-            body = f"New post detected on Facebook page:\n{url}\n\nContent:\n{final_text}\n\nTime: {get_hk_time()}"
-            
-            success = send_email(subject, body)
-            if success:
-                f["status"] = f"NOTIFIED: {final_text[:30]}..."
-            else:
-                f["status"] = "ERROR: Email failed"
+        if monitor["last_post_text"] == final_text:
+            monitor["status"] = "OK: Latest post unchanged; no email required"
+            log_event(state, "FACEBOOK", f"Latest post unchanged for {base_url}.")
+            return state
+
+        page_name = base_url.rsplit("/", 1)[-1]
+        success = send_email(
+            f"[NEW FB POST] {page_name}",
+            f"New Facebook post detected.\n\n"
+            f"Page: {base_url}\n\n"
+            f"Content:\n{final_text}\n\n"
+            f"Checked: {get_hk_time()}",
+        )
+        if success:
+            # Write the new text only after email succeeds; failed sends retry next run.
+            monitor["last_post_text"] = final_text
+            monitor["status"] = f"NOTIFIED ONCE: {shorten(final_text, 60)}"
+            log_event(state, "FACEBOOK", f"New-post email sent for {base_url}.")
         else:
-            f["status"] = "Idle: Up to date"
-            
-    except Exception as e: 
-        f["status"] = f"ERROR: {str(e)[:50]}"
+            monitor["status"] = "EMAIL FAILED: New post detected; will retry next run"
+            log_event(state, "FACEBOOK", f"New post detected but email failed for {base_url}.")
+
+    except Exception as exc:
+        monitor["status"] = f"ERROR: Facebook fetch/check failed; prior post state preserved ({str(exc)[:120]})"
+        log_event(state, "FACEBOOK", monitor["status"])
+
     return state
 
+
+# -----------------------------------------------------------------------------
+# Main execution
+# -----------------------------------------------------------------------------
 def main():
-    if os.environ.get("STOP_ALERTS", "false").lower() == "true": return
+    if os.environ.get("STOP_ALERTS", "false").lower() == "true":
+        print("[SYSTEM] STOP_ALERTS=true. Monitoring cycle intentionally skipped.", flush=True)
+        return
 
     state = load_state()
     state["system"]["last_run"] = get_hk_time()
-    state["system"]["total_runs"] = state["system"].get("total_runs", 0) + 1
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", viewport={"width": 1920, "height": 1080})
-        page = context.new_page()
-        
-        state = check_owndays(page, state)
-        state = check_levis(page, state)
-        for url in FB_PAGES: 
-            state = check_facebook(page, url, state)
-            
-        browser.close()
-    
-    with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2)
-    
-    print("\n--- FINAL STATE REPORT ---")
-    print(json.dumps(state, indent=2))
-    print("--------------------------\n")
+    state["system"]["total_runs"] += 1
+    log_event(state, "SYSTEM", f"Monitoring cycle {state['system']['total_runs']} started.")
 
-if __name__ == "__main__": main()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 1000},
+                locale="en-US",
+            )
+
+            # Separate pages prevent one site's routing or rendering behavior from
+            # interfering with the others.
+            owndays_page = context.new_page()
+            levis_page = context.new_page()
+            facebook_page = context.new_page()
+            configure_lightweight_page(levis_page)
+
+            state = check_owndays(owndays_page, state)
+            state = check_levis(levis_page, state)
+            for facebook_url in FB_PAGES:
+                state = check_facebook(facebook_page, facebook_url, state)
+
+            context.close()
+            browser.close()
+
+    except Exception as exc:
+        log_event(state, "SYSTEM", f"Global browser failure: {type(exc).__name__}: {str(exc)[:180]}")
+
+    state["system"]["last_completed"] = get_hk_time()
+    log_event(state, "SYSTEM", "Monitoring cycle complete.")
+    save_state(state)
+
+    # This is printed inside the GitHub Actions “Run monitoring script” step.
+    print("\n--- FINAL STATE REPORT (state.json) ---", flush=True)
+    print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
+    print("--- END STATE REPORT ---\n", flush=True)
+
+
+if __name__ == "__main__":
+    main()

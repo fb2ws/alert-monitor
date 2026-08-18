@@ -217,15 +217,22 @@ def can_make_fetch(details, target_usage_by_now, expected_next_cost):
 
 
 def request_levis_from_zenrows():
-    """Fetch Levi's via Adaptive Stealth Mode; ZenRows chooses the cheapest viable path."""
+    """Fetch Levi's using ZenRows' documented RESP001 remedies for protected pages."""
     params = {
         "apikey": ZENROWS_API_KEY,
         "url": LEVIS_URL,
-        "mode": "auto",
+        # Levi's is a US storefront. Explicit US residential routing, JS
+        # rendering, and a short load wait implement ZenRows' RESP001 guidance.
+        "js_render": "true",
+        "premium_proxy": "true",
+        "proxy_country": "us",
+        "wait": "5000",
         "response_type": "markdown",
         "original_status": "true",
+        "custom_headers": "true",
     }
-    return requests.get(ZENROWS_FETCH_URL, params=params, timeout=180)
+    headers = {"Referer": "https://www.google.com/"}
+    return requests.get(ZENROWS_FETCH_URL, params=params, headers=headers, timeout=180)
 
 
 def extract_visible_text(content):
@@ -286,8 +293,18 @@ def check_levis(state):
             "final_url": headers.get("Zr-Final-Url", LEVIS_URL),
             "response_length": len(content),
             "response_sample": shorten(content, 360),
-            "request_mode": "mode=auto + response_type=markdown",
+            "request_mode": "js_render + premium_proxy + proxy_country=us + wait=5000 + markdown",
         }
+
+        # ZenRows returns detailed JSON errors such as RESP001. Preserve the
+        # provider code and message in state without changing alert state.
+        if response.status_code != 200:
+            try:
+                provider_error = response.json()
+            except ValueError:
+                provider_error = {}
+            monitor["fetch"]["provider_error_code"] = provider_error.get("code", "")
+            monitor["fetch"]["provider_error_title"] = provider_error.get("title", "")
 
         # Refresh live usage after a successful API response. This measures the
         # actual credit delta and dynamically raises/lower future check frequency.
@@ -305,7 +322,12 @@ def check_levis(state):
                 state["budget"]["usage_refresh_error"] = str(usage_exc)[:140]
 
         if response.status_code != 200:
-            monitor["status"] = f"ERROR: ZenRows returned HTTP {response.status_code}; promotion state preserved"
+            provider_code = monitor["fetch"].get("provider_error_code", "")
+            provider_title = monitor["fetch"].get("provider_error_title", "")
+            monitor["status"] = (
+                f"ERROR: ZenRows HTTP {response.status_code} {provider_code} {provider_title}; "
+                "promotion state preserved"
+            ).strip()
             log_event(state, "LEVIS", monitor["status"])
             return state
 

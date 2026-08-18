@@ -22,7 +22,7 @@ FB_PAGES = [
 
 OWNDAYS_URL = "https://www.owndays.com/jp/en/products/SENICHI31?sku=6259"
 STATE_FILE = "state.json"
-HK_TZ = timezone(timedelta(hours=8))
+HK_TZ = timezone(timedelta(hours=8 ))
 
 BLOCK_MARKERS = (
     "captcha",
@@ -59,7 +59,10 @@ def log_event(state, category, message):
 def send_email(subject, body):
     """Send a UTF-8 Gmail SMTP email and return True only on confirmed submission."""
     if not (EMAIL_USER and EMAIL_PASS and RECEIVER_EMAIL):
-        print("[EMAIL] Credentials are missing: check EMAIL_USER, EMAIL_PASS, RECEIVER_EMAIL.", flush=True)
+        print(
+            "[EMAIL] Credentials are missing: check EMAIL_USER, EMAIL_PASS, RECEIVER_EMAIL.",
+            flush=True,
+        )
         return False
 
     try:
@@ -107,7 +110,7 @@ def load_state():
     state.setdefault("history", [])
     state["monitors"].setdefault("owndays", {})
     state["monitors"].setdefault("fb", {})
-    state["monitors"].pop("levis", None)  # Retired permanently.
+    state["monitors"].pop("levis", None)
     state["system"].setdefault("total_runs", 0)
     state["system"]["timezone"] = "Asia/Hong_Kong (UTC+8)"
     return state
@@ -124,7 +127,7 @@ def update_fetch_details(monitor, response, page, visible_text, url):
         "when": get_hk_time(),
         "url": url,
         "http_status": response.status if response else None,
-        "page_title": shorten(page.title(), 160),
+        "page_title": shorten(page.title( ), 160),
         "visible_text_length": len(visible_text),
         "visible_text_sample": shorten(visible_text, 260),
     }
@@ -155,34 +158,45 @@ def check_owndays(page, state):
     monitor.setdefault("in_stock", False)
     monitor.setdefault("count", 0)
     monitor.setdefault("status", "Initializing")
-    monitor.pop("stock_phrase_found", None)  # Old phrase-only monitor field.
+    monitor.pop("stock_phrase_found", None)
     monitor["last_check"] = get_hk_time()
 
     try:
         response = page.goto(OWNDAYS_URL, timeout=45000, wait_until="domcontentloaded")
-        # Wait for the monitored element rather than a fixed multi-second delay.
         try:
-            page.locator("form#cart-add button").first.wait_for(state="attached", timeout=12000)
+            page.locator("form#cart-add button").first.wait_for(
+                state="attached", timeout=12000
+            )
         except Exception:
-            pass  # The later verification records a clear UNVERIFIED state.
+            pass
+
         visible_text = page.locator("body").inner_text(timeout=12000)
         normalized_text = shorten(visible_text, 100000)
         update_fetch_details(monitor, response, page, normalized_text, OWNDAYS_URL)
 
         if page_looks_blocked(page, normalized_text):
-            monitor["status"] = "BLOCKED: Owndays showed a CAPTCHA/access check; prior stock state preserved"
+            monitor["status"] = (
+                "BLOCKED: Owndays showed a CAPTCHA/access check; prior stock state preserved"
+            )
             log_event(state, "OWNDAYS", monitor["status"])
             return state
 
         if len(normalized_text) < 100:
-            monitor["status"] = "UNVERIFIED: Too little visible text; prior stock state preserved"
+            monitor["status"] = (
+                "UNVERIFIED: Too little visible text; prior stock state preserved"
+            )
             log_event(state, "OWNDAYS", monitor["status"])
             return state
 
         cart_button = page.locator("form#cart-add button").first
         if cart_button.count() == 0:
-            monitor["cart_button"] = {"found": False, "selector": "form#cart-add button"}
-            monitor["status"] = "UNVERIFIED: form#cart-add button was not found; prior stock state preserved"
+            monitor["cart_button"] = {
+                "found": False,
+                "selector": "form#cart-add button",
+            }
+            monitor["status"] = (
+                "UNVERIFIED: form#cart-add button was not found; prior stock state preserved"
+            )
             log_event(state, "OWNDAYS", monitor["status"])
             return state
 
@@ -196,23 +210,31 @@ def check_owndays(page, state):
         }
         monitor["stock_evidence"] = button_text
 
-        # Exact requested condition: unavailable if disabled OR text is Out Of Stock Online.
         is_out_of_stock = is_disabled or button_text.casefold() == "out of stock online"
         if is_out_of_stock:
             monitor["in_stock"] = False
             monitor["count"] = 0
-            monitor["status"] = "OK: Fetch succeeded; cart-add button is unavailable / Out Of Stock Online"
+            monitor["status"] = (
+                "OK: Fetch succeeded; cart-add button is unavailable / Out Of Stock Online"
+            )
             log_event(
                 state,
                 "OWNDAYS",
-                f"Fetch OK (HTTP {monitor['fetch']['http_status']}); cart button text='{button_text}', disabled={is_disabled}.",
+                (
+                    f"Fetch OK (HTTP {monitor['fetch']['http_status']} ); "
+                    f"cart button text='{button_text}', disabled={is_disabled}."
+                ),
             )
             return state
 
         log_event(
             state,
             "OWNDAYS",
-            f"Fetch OK (HTTP {monitor['fetch']['http_status']}); cart button text='{button_text}', disabled={is_disabled}; availability condition met.",
+            (
+                f"Fetch OK (HTTP {monitor['fetch']['http_status']} ); "
+                f"cart button text='{button_text}', disabled={is_disabled}; "
+                "availability condition met."
+            ),
         )
 
         if not monitor["in_stock"]:
@@ -220,7 +242,7 @@ def check_owndays(page, state):
                 "[ALERT] Owndays Item Appears Available (1/5)",
                 "The requested Owndays cart button condition indicates availability.\n\n"
                 f"Product: {OWNDAYS_URL}\n"
-                f"Button selector: form#cart-add button\n"
+                "Button selector: form#cart-add button\n"
                 f"Button text: {button_text}\n"
                 f"Button disabled: {is_disabled}\n"
                 f"Page title: {monitor['fetch']['page_title']}\n\n"
@@ -229,11 +251,19 @@ def check_owndays(page, state):
             if success:
                 monitor["in_stock"] = True
                 monitor["count"] = 1
-                monitor["status"] = "ALERTING: Cart button indicates availability; email 1/5 sent"
+                monitor["status"] = (
+                    "ALERTING: Cart button indicates availability; email 1/5 sent"
+                )
                 log_event(state, "OWNDAYS", "Availability alert email 1/5 sent.")
             else:
-                monitor["status"] = "EMAIL FAILED: Availability condition detected; will retry next run"
-                log_event(state, "OWNDAYS", "Availability condition detected but email failed; state not advanced.")
+                monitor["status"] = (
+                    "EMAIL FAILED: Availability condition detected; will retry next run"
+                )
+                log_event(
+                    state,
+                    "OWNDAYS",
+                    "Availability condition detected but email failed; state not advanced.",
+                )
 
         elif monitor["count"] < 5:
             reminder_number = monitor["count"] + 1
@@ -247,18 +277,35 @@ def check_owndays(page, state):
             )
             if success:
                 monitor["count"] = reminder_number
-                monitor["status"] = f"ALERTING: Availability persists; email {reminder_number}/5 sent"
-                log_event(state, "OWNDAYS", f"Availability reminder email {reminder_number}/5 sent.")
+                monitor["status"] = (
+                    f"ALERTING: Availability persists; email {reminder_number}/5 sent"
+                )
+                log_event(
+                    state,
+                    "OWNDAYS",
+                    f"Availability reminder email {reminder_number}/5 sent.",
+                )
             else:
-                monitor["status"] = "EMAIL FAILED: Availability persists; will retry current reminder"
-                log_event(state, "OWNDAYS", "Availability reminder email failed; counter not advanced.")
+                monitor["status"] = (
+                    "EMAIL FAILED: Availability persists; will retry current reminder"
+                )
+                log_event(
+                    state,
+                    "OWNDAYS",
+                    "Availability reminder email failed; counter not advanced.",
+                )
 
         else:
-            monitor["status"] = "PAUSED: Availability persists; 5/5 email reminders already sent"
+            monitor["status"] = (
+                "PAUSED: Availability persists; 5/5 email reminders already sent"
+            )
             log_event(state, "OWNDAYS", "Availability remains positive; reminder cap reached.")
 
     except Exception as exc:
-        monitor["status"] = f"ERROR: Owndays fetch/check failed; prior state preserved ({str(exc)[:120]})"
+        monitor["status"] = (
+            "ERROR: Owndays fetch/check failed; prior state preserved "
+            f"({str(exc)[:120]})"
+        )
         log_event(state, "OWNDAYS", monitor["status"])
 
     return state
@@ -267,12 +314,140 @@ def check_owndays(page, state):
 # -----------------------------------------------------------------------------
 # Facebook: compare clean post content and email once per new post
 # -----------------------------------------------------------------------------
+FACEBOOK_INTERFACE_MARKERS = (
+    "facebook",
+    "log in",
+    "create new account",
+    "all reactions",
+    "view more comments",
+    "view more replies",
+)
+
+FACEBOOK_INTERFACE_ONLY = {
+    "home",
+    "menu",
+    "like",
+    "comment",
+    "share",
+}
+
+
 def clean_facebook_post_text(raw_text):
+    """Remove Facebook's dynamic interface/reaction text from candidate content."""
     text = raw_text.replace("See more", "").replace("See More", "")
     text = re.sub(r"All reactions:.*", "", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"\bLike\s+Comment\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"\bView more(?: comments| replies)?\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(
+        r"\bLike\s+Comment(?:\s+Share)?\b.*",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"\bView more(?: comments| replies)?\b.*",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     return shorten(text, 900)
+
+
+def is_clean_facebook_candidate(text):
+    """Accept only meaningful post-body candidates, never generic Facebook UI text."""
+    normalized = shorten(text, 900)
+    lowered = normalized.casefold()
+    if len(normalized) < 5:
+        return False
+    if any(marker in lowered for marker in FACEBOOK_INTERFACE_MARKERS):
+        return False
+    if lowered in FACEBOOK_INTERFACE_ONLY:
+        return False
+    if re.fullmatch(
+        r"(?:\d+\s*)?(?:m|h|d|w|y|mins?|hours?|days?|weeks?)\s*·?",
+        lowered,
+    ):
+        return False
+    return True
+
+
+def combine_facebook_blocks(blocks, page_identifier=""):
+    """Keep post-body blocks in DOM order while removing nested/duplicate text."""
+    page_identifier = page_identifier.casefold()
+    kept = []
+
+    for block in blocks:
+        candidate = clean_facebook_post_text(block)
+        if not is_clean_facebook_candidate(candidate):
+            continue
+        if page_identifier and candidate.casefold() == page_identifier:
+            continue
+
+        if any(candidate == existing or candidate in existing for existing in kept):
+            continue
+        kept = [existing for existing in kept if existing not in candidate]
+        kept.append(candidate)
+
+    return shorten(" ".join(kept), 900)
+
+
+def facebook_post_is_unchanged(previous_text, candidate_text):
+    """Treat a cleaner rendering of the saved post as unchanged, not as a new post."""
+    previous = clean_facebook_post_text(previous_text).casefold()
+    candidate = clean_facebook_post_text(candidate_text).casefold()
+    return bool(
+        previous
+        and candidate
+        and (previous == candidate or previous in candidate or candidate in previous)
+    )
+
+
+def extract_facebook_post_text(page, page_url):
+    """Read the first clean, post-scoped text candidate across Facebook layouts."""
+    diagnostics = {}
+    page_identifier = page_url.rstrip("/").rsplit("/", 1)[-1]
+
+    sources = [
+        (
+            "data-ad-comet-preview",
+            page.locator(
+                "div[data-ad-comet-preview='message'] :is(div, span)[dir='auto']"
+            ),
+        ),
+        (
+            "data-ad-preview",
+            page.locator(
+                "div[data-ad-preview='message'] :is(div, span)[dir='auto']"
+            ),
+        ),
+    ]
+
+    articles = page.locator("div[role='article']")
+    article_count = min(articles.count(), 3)
+    diagnostics["article_containers"] = article_count
+
+    for index in range(article_count):
+        sources.append(
+            (
+                f"article_{index + 1}",
+                articles.nth(index).locator(":is(div, span)[dir='auto']"),
+            )
+        )
+
+    for source_name, locator in sources:
+        try:
+            block_count = locator.count()
+            diagnostics[source_name] = block_count
+            if block_count == 0:
+                continue
+
+            combined = combine_facebook_blocks(
+                locator.all_inner_texts(), page_identifier
+            )
+            if is_clean_facebook_candidate(combined):
+                return combined, source_name, diagnostics
+        except Exception as exc:
+            diagnostics[source_name] = f"read error: {type(exc).__name__}"
+
+    return "", "", diagnostics
 
 
 def check_facebook(page, url, state):
@@ -282,48 +457,53 @@ def check_facebook(page, url, state):
         url,
         {"status": "Initializing", "last_post_text": "", "last_check": ""},
     )
-    monitor.pop("id", None)  # Remove retired photo-ID tracking data.
+    monitor.pop("id", None)
     monitor["last_check"] = get_hk_time()
 
     try:
         response = page.goto(base_url, timeout=45000, wait_until="domcontentloaded")
-        # Wait only until Facebook exposes a candidate post; do not hold every
-        # scheduled run in a fixed 8–12 second sleep.
         try:
             page.locator(
                 "div[data-ad-comet-preview='message'], div[role='article']"
             ).first.wait_for(state="visible", timeout=15000)
         except Exception:
-            pass  # The later UNVERIFIED state gives a transparent result.
-
-        post_container = page.locator("div[data-ad-comet-preview='message']").first
-        raw_text = ""
-        if post_container.is_visible():
-            text_blocks = post_container.locator("div[dir='auto']").all_inner_texts()
-            raw_text = " ".join(block.strip() for block in text_blocks if block.strip())
-
-        if not raw_text:
-            article = page.locator("div[role='article']").first
-            if article.is_visible():
-                text_blocks = article.locator("div[dir='auto']").all_inner_texts()
-                raw_text = " ".join(block.strip() for block in text_blocks if block.strip())
+            pass
 
         visible_text = page.locator("body").inner_text(timeout=15000)
         update_fetch_details(monitor, response, page, visible_text, base_url)
 
-        if not raw_text:
-            monitor["status"] = "UNVERIFIED: No clean div[dir='auto'] post text found; prior post state preserved"
-            log_event(state, "FACEBOOK", f"No clean latest-post text found for {base_url}.")
+        if page_looks_blocked(page, visible_text):
+            monitor["status"] = (
+                "BLOCKED: Facebook showed a CAPTCHA/access check; prior post state preserved"
+            )
+            log_event(state, "FACEBOOK", f"Access check detected for {base_url}.")
             return state
 
-        final_text = clean_facebook_post_text(raw_text)
+        final_text, extraction_source, extraction_diagnostics = (
+            extract_facebook_post_text(page, base_url)
+        )
+        monitor["extraction"] = {
+            "source": extraction_source or "none",
+            "selector_counts": extraction_diagnostics,
+        }
         monitor["candidate_post_text"] = final_text
-        if len(final_text) < 5:
-            monitor["status"] = "UNVERIFIED: Extracted post text was too short; prior post state preserved"
-            log_event(state, "FACEBOOK", f"Post content too short for {base_url}.")
+
+        if not final_text:
+            monitor["status"] = (
+                "UNVERIFIED: No clean post-body text found across Facebook layout selectors; "
+                "prior post state preserved"
+            )
+            log_event(
+                state,
+                "FACEBOOK",
+                (
+                    f"No clean latest-post text found for {base_url}; "
+                    f"selector counts: {extraction_diagnostics}"
+                ),
+            )
             return state
 
-        if monitor["last_post_text"] == final_text:
+        if facebook_post_is_unchanged(monitor["last_post_text"], final_text):
             monitor["status"] = "OK: Latest post unchanged; no email required"
             log_event(state, "FACEBOOK", f"Latest post unchanged for {base_url}.")
             return state
@@ -331,22 +511,29 @@ def check_facebook(page, url, state):
         page_name = base_url.rsplit("/", 1)[-1]
         success = send_email(
             f"[NEW FB POST] {page_name}",
-            f"New Facebook post detected.\n\n"
+            "New Facebook post detected.\n\n"
             f"Page: {base_url}\n\n"
             f"Content:\n{final_text}\n\n"
             f"Checked: {get_hk_time()}",
         )
+
         if success:
-            # Write new content only after email succeeds; failed sends retry next run.
             monitor["last_post_text"] = final_text
             monitor["status"] = f"NOTIFIED ONCE: {shorten(final_text, 60)}"
             log_event(state, "FACEBOOK", f"New-post email sent for {base_url}.")
         else:
             monitor["status"] = "EMAIL FAILED: New post detected; will retry next run"
-            log_event(state, "FACEBOOK", f"New post detected but email failed for {base_url}.")
+            log_event(
+                state,
+                "FACEBOOK",
+                f"New post detected but email failed for {base_url}.",
+            )
 
     except Exception as exc:
-        monitor["status"] = f"ERROR: Facebook fetch/check failed; prior post state preserved ({str(exc)[:120]})"
+        monitor["status"] = (
+            "ERROR: Facebook fetch/check failed; prior state preserved "
+            f"({str(exc)[:120]})"
+        )
         log_event(state, "FACEBOOK", monitor["status"])
 
     return state
@@ -381,9 +568,6 @@ def main():
                 locale="en-US",
             )
 
-            # Images, media, and fonts are not needed for text/button checks.
-            # Blocking them reduces transfer and startup time without changing
-            # the monitored DOM conditions.
             context.route(
                 "**/*",
                 lambda route: route.abort()
@@ -393,6 +577,7 @@ def main():
 
             owndays_page = context.new_page()
             facebook_page = context.new_page()
+
             state = check_owndays(owndays_page, state)
             for facebook_url in FB_PAGES:
                 state = check_facebook(facebook_page, facebook_url, state)
@@ -401,13 +586,16 @@ def main():
             browser.close()
 
     except Exception as exc:
-        log_event(state, "SYSTEM", f"Global browser failure: {type(exc).__name__}: {str(exc)[:180]}")
+        log_event(
+            state,
+            "SYSTEM",
+            f"Global browser failure: {type(exc).__name__}: {str(exc)[:180]}",
+        )
 
     state["system"]["last_completed"] = get_hk_time()
     log_event(state, "SYSTEM", "Monitoring cycle complete.")
     save_state(state)
 
-    # Printed inside GitHub Actions → monitor → Run monitoring script.
     print("\n--- FINAL STATE REPORT (state.json) ---", flush=True)
     print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
     print("--- END STATE REPORT ---\n", flush=True)

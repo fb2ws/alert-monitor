@@ -171,10 +171,6 @@ def prepare_budget(state):
     total_seconds = (details["period_end"] - details["period_start"]).total_seconds()
     elapsed_seconds = max(0, min((now_utc - details["period_start"]).total_seconds(), total_seconds))
 
-    # The first Fetch assumes the 25-credit protected maximum. After a Fetch,
-    # the script reads live usage again and uses the actual observed cost to pace
-    # later checks. The separate 25-credit safety reserve still prevents an
-    # unexpected cost increase from taking usage above the Free-plan ceiling.
     prior_budget = state.get("budget", {})
     expected_next_cost = float(prior_budget.get("expected_next_fetch_credits", WORST_CASE_FETCH_COST))
     expected_next_cost = max(1.0, min(WORST_CASE_FETCH_COST, expected_next_cost))
@@ -221,13 +217,11 @@ def request_levis_from_zenrows():
     params = {
         "apikey": ZENROWS_API_KEY,
         "url": LEVIS_URL,
-        # Levi's is a US storefront. Explicit US residential routing, JS
-        # rendering, and a short load wait implement ZenRows' RESP001 guidance.
         "js_render": "true",
+        "antibot": "true",          # CRITICAL: Bypasses Akamai Bot Manager
         "premium_proxy": "true",
         "proxy_country": "us",
-        "wait": "5000",
-        "response_type": "markdown",
+        "wait": "5000",             # Allow React/Angular components to mount
         "original_status": "true",
         "custom_headers": "true",
     }
@@ -293,11 +287,9 @@ def check_levis(state):
             "final_url": headers.get("Zr-Final-Url", LEVIS_URL),
             "response_length": len(content),
             "response_sample": shorten(content, 360),
-            "request_mode": "js_render + premium_proxy + proxy_country=us + wait=5000 + markdown",
+            "request_mode": "js_render + antibot + premium_proxy + proxy_country=us + wait=5000",
         }
 
-        # ZenRows returns detailed JSON errors such as RESP001. Preserve the
-        # provider code and message in state without changing alert state.
         if response.status_code != 200:
             try:
                 provider_error = response.json()
@@ -306,8 +298,6 @@ def check_levis(state):
             monitor["fetch"]["provider_error_code"] = provider_error.get("code", "")
             monitor["fetch"]["provider_error_title"] = provider_error.get("title", "")
 
-        # Refresh live usage after a successful API response. This measures the
-        # actual credit delta and dynamically raises/lower future check frequency.
         if response.status_code == 200:
             try:
                 after_fetch = get_subscription_details()

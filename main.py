@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import re
 import smtplib
 from datetime import datetime, timedelta, timezone
@@ -160,9 +159,13 @@ def check_owndays(page, state):
     monitor["last_check"] = get_hk_time()
 
     try:
-        response = page.goto(OWNDAYS_URL, timeout=60000, wait_until="domcontentloaded")
-        page.wait_for_timeout(random.randint(4500, 7000))
-        visible_text = page.locator("body").inner_text(timeout=15000)
+        response = page.goto(OWNDAYS_URL, timeout=45000, wait_until="domcontentloaded")
+        # Wait for the monitored element rather than a fixed multi-second delay.
+        try:
+            page.locator("form#cart-add button").first.wait_for(state="attached", timeout=12000)
+        except Exception:
+            pass  # The later verification records a clear UNVERIFIED state.
+        visible_text = page.locator("body").inner_text(timeout=12000)
         normalized_text = shorten(visible_text, 100000)
         update_fetch_details(monitor, response, page, normalized_text, OWNDAYS_URL)
 
@@ -283,8 +286,15 @@ def check_facebook(page, url, state):
     monitor["last_check"] = get_hk_time()
 
     try:
-        response = page.goto(base_url, timeout=60000, wait_until="domcontentloaded")
-        page.wait_for_timeout(random.randint(8000, 12000))
+        response = page.goto(base_url, timeout=45000, wait_until="domcontentloaded")
+        # Wait only until Facebook exposes a candidate post; do not hold every
+        # scheduled run in a fixed 8–12 second sleep.
+        try:
+            page.locator(
+                "div[data-ad-comet-preview='message'], div[role='article']"
+            ).first.wait_for(state="visible", timeout=15000)
+        except Exception:
+            pass  # The later UNVERIFIED state gives a transparent result.
 
         post_container = page.locator("div[data-ad-comet-preview='message']").first
         raw_text = ""
@@ -369,6 +379,16 @@ def main():
                 ),
                 viewport={"width": 1440, "height": 1000},
                 locale="en-US",
+            )
+
+            # Images, media, and fonts are not needed for text/button checks.
+            # Blocking them reduces transfer and startup time without changing
+            # the monitored DOM conditions.
+            context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in {"image", "media", "font"}
+                else route.continue_(),
             )
 
             owndays_page = context.new_page()

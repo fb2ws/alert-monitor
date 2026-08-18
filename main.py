@@ -400,7 +400,7 @@ def facebook_post_is_unchanged(previous_text, candidate_text):
     )
 
 
-def extract_facebook_post_text(page, page_url):
+def extract_facebook_post_text(page, page_url ):
     """Read the first clean, post-scoped text candidate across Facebook layouts."""
     diagnostics = {}
     page_identifier = page_url.rstrip("/").rsplit("/", 1)[-1]
@@ -420,6 +420,9 @@ def extract_facebook_post_text(page, page_url):
         ),
     ]
 
+    # The markup attributes above do not appear on every public Facebook
+    # layout. Examine only the first few articles separately, never merging
+    # text from several posts into a single comparison value.
     articles = page.locator("div[role='article']")
     article_count = min(articles.count(), 3)
     diagnostics["article_containers"] = article_count
@@ -450,6 +453,25 @@ def extract_facebook_post_text(page, page_url):
     return "", "", diagnostics
 
 
+def wait_for_facebook_post_text(page, page_url, attempts=5, interval_ms=3000):
+    """Allow Facebook's delayed public feed to replace the initial profile shell."""
+    last_diagnostics = {}
+
+    for attempt in range(1, attempts + 1):
+        final_text, source, diagnostics = extract_facebook_post_text(page, page_url)
+        diagnostics["attempt"] = attempt
+        diagnostics["max_attempts"] = attempts
+
+        if final_text:
+            return final_text, source, diagnostics
+
+        last_diagnostics = diagnostics
+        if attempt < attempts:
+            page.wait_for_timeout(interval_ms)
+
+    return "", "", last_diagnostics
+
+
 def check_facebook(page, url, state):
     base_url = url.rstrip("/")
     monitors = state["monitors"].setdefault("fb", {})
@@ -462,26 +484,35 @@ def check_facebook(page, url, state):
 
     try:
         response = page.goto(base_url, timeout=45000, wait_until="domcontentloaded")
-        try:
-            page.locator(
-                "div[data-ad-comet-preview='message'], div[role='article']"
-            ).first.wait_for(state="visible", timeout=15000)
-        except Exception:
-            pass
+        page.locator("body").wait_for(state="visible", timeout=15000)
 
-        visible_text = page.locator("body").inner_text(timeout=15000)
-        update_fetch_details(monitor, response, page, visible_text, base_url)
-
-        if page_looks_blocked(page, visible_text):
+        # Facebook frequently returns a public profile shell first, then adds
+        # post elements after rendering/hydration. Check once immediately and
+        # then retry a bounded four times at three-second intervals.
+        initial_visible_text = page.locator("body").inner_text(timeout=15000)
+        if page_looks_blocked(page, initial_visible_text):
+            update_fetch_details(
+                monitor,
+                response,
+                page,
+                initial_visible_text,
+                base_url,
+            )
             monitor["status"] = (
-                "BLOCKED: Facebook showed a CAPTCHA/access check; prior post state preserved"
+                "BLOCKED: Facebook showed a CAPTCHA/access check; "
+                "prior post state preserved"
             )
             log_event(state, "FACEBOOK", f"Access check detected for {base_url}.")
             return state
 
         final_text, extraction_source, extraction_diagnostics = (
-            extract_facebook_post_text(page, base_url)
+            wait_for_facebook_post_text(page, base_url)
         )
+
+        # Record the page after the bounded feed-readiness wait, not only the
+        # initial profile shell.
+        visible_text = page.locator("body").inner_text(timeout=15000)
+        update_fetch_details(monitor, response, page, visible_text, base_url)
         monitor["extraction"] = {
             "source": extraction_source or "none",
             "selector_counts": extraction_diagnostics,
@@ -490,14 +521,15 @@ def check_facebook(page, url, state):
 
         if not final_text:
             monitor["status"] = (
-                "UNVERIFIED: No clean post-body text found across Facebook layout selectors; "
-                "prior post state preserved"
+                "UNVERIFIED: Facebook returned a profile shell or no clean "
+                "post body after bounded feed wait; prior post state preserved"
             )
             log_event(
                 state,
                 "FACEBOOK",
                 (
-                    f"No clean latest-post text found for {base_url}; "
+                    f"No clean latest-post text found for {base_url} after "
+                    f"{extraction_diagnostics.get('attempt', 0)} extraction attempt(s); "
                     f"selector counts: {extraction_diagnostics}"
                 ),
             )
@@ -537,6 +569,7 @@ def check_facebook(page, url, state):
         log_event(state, "FACEBOOK", monitor["status"])
 
     return state
+
 
 
 # -----------------------------------------------------------------------------

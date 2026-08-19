@@ -400,8 +400,8 @@ def facebook_post_is_unchanged(previous_text, candidate_text):
     )
 
 
-def extract_facebook_post_text(page, page_url ):
-    """Read the first clean, post-scoped text candidate across Facebook layouts."""
+def extract_facebook_post_text(page, page_url):
+    """Read the first clean post message from explicit Facebook message containers."""
     diagnostics = {}
     page_identifier = page_url.rstrip("/").rsplit("/", 1)[-1]
 
@@ -420,20 +420,12 @@ def extract_facebook_post_text(page, page_url ):
         ),
     ]
 
-    # The markup attributes above do not appear on every public Facebook
-    # layout. Examine only the first few articles separately, never merging
-    # text from several posts into a single comparison value.
-    articles = page.locator("div[role='article']")
-    article_count = min(articles.count(), 3)
-    diagnostics["article_containers"] = article_count
-
-    for index in range(article_count):
-        sources.append(
-            (
-                f"article_{index + 1}",
-                articles.nth(index).locator(":is(div, span)[dir='auto']"),
-            )
-        )
+    # Do NOT fall back to div[role='article']. Facebook uses that role for
+    # posts, comments, and replies. A prior article_2 fallback incorrectly
+    # treated the commenter name “San Lee” as a new page post.
+    diagnostics["article_fallback"] = (
+        "disabled: comments/replies can also be articles"
+    )
 
     for source_name, locator in sources:
         try:
@@ -447,6 +439,7 @@ def extract_facebook_post_text(page, page_url ):
             )
             if is_clean_facebook_candidate(combined):
                 return combined, source_name, diagnostics
+
         except Exception as exc:
             diagnostics[source_name] = f"read error: {type(exc).__name__}"
 
@@ -454,7 +447,7 @@ def extract_facebook_post_text(page, page_url ):
 
 
 def wait_for_facebook_post_text(page, page_url, attempts=5, interval_ms=3000):
-    """Allow Facebook's delayed public feed to replace the initial profile shell."""
+    """Allow the delayed public Facebook feed to replace the profile shell."""
     last_diagnostics = {}
 
     for attempt in range(1, attempts + 1):

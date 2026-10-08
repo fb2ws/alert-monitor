@@ -8,7 +8,8 @@ on:
 permissions:
   contents: read
 
-# Prevent overlapping runs from reading and saving state.json simultaneously.
+# One monitor run at a time prevents state-cache races. Runs wait rather than
+# being cancelled halfway through an email or state save.
 concurrency:
   group: alert-monitor-single-run
   cancel-in-progress: false
@@ -17,13 +18,13 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 8
-
     env:
-      # Chromium is already installed in this path inside the pinned image.
+      # The browser image stores its preinstalled executables here.
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
 
-    # Version-matched Playwright image: Chromium and all Linux browser
-    # dependencies are already included. No apt-get or browser installation.
+    # This pinned image already contains Chromium and its Linux dependencies.
+    # It replaces apt-get and `playwright install --with-deps`, which caused
+    # the multi-hour queueing problem on the hosted runner.
     container:
       image: mcr.microsoft.com/playwright/python:v1.46.0-jammy
       options: --user 1001
@@ -32,10 +33,11 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Install Python package in the Playwright container
+    - name: Install Python packages in the container
       run: |
-        # Use the container's native Ubuntu 22.04-compatible Python.
-        # Do NOT add actions/setup-python here.
+        # Do not use actions/setup-python here: its Ubuntu 24.04 Python
+        # requires GLIBC 2.38, while the version-matched browser image is
+        # Ubuntu 22.04. Use the container's compatible Python instead.
         python3 --version
         python3 -m pip install --user --disable-pip-version-check -r requirements.txt
 
@@ -52,6 +54,14 @@ jobs:
         EMAIL_USER: ${{ secrets.EMAIL_USER }}
         EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
         RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        CLEAN_SENT_ALERTS: ${{ vars.CLEAN_SENT_ALERTS }}
+        # Repository variable FB_PAGES: one URL per line (or comma-separated).
+        # Example:
+        # https://www.facebook.com/phone2phone.hk
+        # https://www.facebook.com/kimbihome
+        # https://www.facebook.com/hahaphone.hk
+        FB_PAGES: ${{ vars.FB_PAGES }}
+        # Legacy fallback supported by main.py during migration:
         FB_PAGE_1: ${{ secrets.FB_PAGE_1 }}
         FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
         FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}

@@ -1,10 +1,12 @@
 import imaplib
+import hashlib
 import json
 import os
 import re
 import smtplib
 import time
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid
@@ -83,6 +85,38 @@ def get_hk_time():
 def shorten(text, limit=240):
     """Normalize whitespace and return a readable, bounded diagnostic string."""
     return " ".join((text or "").split())[:limit]
+
+
+def facebook_candidate_fingerprint(text):
+    """Return a stable digest for a normalized Facebook candidate."""
+    normalized = clean_facebook_post_text(text).casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def compare_facebook_candidates(previous_text, candidate_text, recent_candidates=None):
+    """Explain whether two renderings represent the same text-based post."""
+    previous = clean_facebook_post_text(previous_text)
+    candidate = clean_facebook_post_text(candidate_text)
+    previous_folded = previous.casefold()
+    candidate_folded = candidate.casefold()
+    ratio = SequenceMatcher(None, previous_folded, candidate_folded).ratio() if previous_folded and candidate_folded else 0.0
+
+    if not previous_folded:
+        return False, "no previous candidate", ratio, False
+    if previous_folded == candidate_folded:
+        return True, "exact normalized match", ratio, False
+    if previous_folded in candidate_folded or candidate_folded in previous_folded:
+        return True, "one normalized candidate contains the other", ratio, False
+    if len(previous_folded) >= 24 and len(candidate_folded) >= 24 and ratio >= 0.92:
+        return True, f"high text similarity ({ratio:.3f})", ratio, False
+
+    # A candidate that was already alerted is treated as a duplicate even if
+    # Facebook temporarily rendered it differently between workflow runs.
+    candidate_digest = facebook_candidate_fingerprint(candidate)
+    for item in recent_candidates or []:
+        if item.get("fingerprint") == candidate_digest and item.get("alerted"):
+            return True, "candidate fingerprint was alerted previously", ratio, True
+    return False, "candidate differs from saved post", ratio, False
 
 
 def log_event(state, category, message):
@@ -504,6 +538,8 @@ def check_facebook(page, url, state):
         {"status": "Initializing", "last_post_text": "", "last_check": ""},
     )
     monitor.pop("id", None)  # Remove retired photo-ID tracking data.
+    monitor.setdefault("candidate_history", [])
+    monitor.setdefault("comparison", {})
     monitor["last_check"] = get_hk_time()
 
     try:
@@ -539,9 +575,44 @@ def check_facebook(page, url, state):
             )
             return state
 
-        if facebook_post_is_unchanged(monitor["last_post_text"], final_text):
+        previous_text = monitor.get("last_post_text", "")
+        previous_fingerprint = facebook_candidate_fingerprint(previous_text) if previous_text else ""
+        candidate_fingerprint = facebook_candidate_fingerprint(final_text)
+        unchanged, comparison_reason, similarity, previously_alerted = compare_facebook_candidates(
+            previous_text,
+            final_text,
+            monitor.get("candidate_history", []),
+        )
+        monitor["comparison"] = {
+            "checked_at": get_hk_time(),
+            "decision": "duplicate_or_unchanged" if unchanged else "candidate_changed",
+            "reason": comparison_reason,
+            "similarity": round(similarity, 3),
+            "previous_fingerprint": previous_fingerprint,
+            "candidate_fingerprint": candidate_fingerprint,
+            "previous_candidate": shorten(previous_text, 300),
+            "latest_candidate": shorten(final_text, 300),
+            "previously_alerted": previously_alerted,
+        }
+        monitor["candidate_history"].append(
+            {
+                "observed_at": get_hk_time(),
+                "fingerprint": candidate_fingerprint,
+                "candidate": shorten(final_text, 300),
+                "alerted": False,
+                "comparison_reason": comparison_reason,
+            }
+        )
+        monitor["candidate_history"] = monitor["candidate_history"][-20:]
+
+        if unchanged:
             monitor["status"] = "OK: Latest post unchanged; no email required"
-            log_event(state, "FACEBOOK", f"Latest post unchanged for {base_url}.")
+            log_event(
+                state,
+                "FACEBOOK",
+                f"Duplicate suppressed for {base_url}; reason={comparison_reason}; "
+                f"previous={shorten(previous_text, 160)!r}; latest={shorten(final_text, 160)!r}",
+            )
             return state
 
         page_name = base_url.rsplit("/", 1)[-1]
@@ -555,8 +626,17 @@ def check_facebook(page, url, state):
         if success:
             # Write new content only after email succeeds; failed sends retry next run.
             monitor["last_post_text"] = final_text
+            for item in reversed(monitor["candidate_history"]):
+                if item["fingerprint"] == candidate_fingerprint:
+                    item["alerted"] = True
+                    break
             monitor["status"] = f"NOTIFIED ONCE: {shorten(final_text, 60)}"
-            log_event(state, "FACEBOOK", f"New-post email sent for {base_url}.")
+            log_event(
+                state,
+                "FACEBOOK",
+                f"New-post email sent for {base_url}; previous={shorten(previous_text, 160)!r}; "
+                f"latest={shorten(final_text, 160)!r}; fingerprint={candidate_fingerprint}",
+            )
         else:
             monitor["status"] = "EMAIL FAILED: New post detected; will retry next run"
             log_event(state, "FACEBOOK", f"New post detected but email failed for {base_url}.")

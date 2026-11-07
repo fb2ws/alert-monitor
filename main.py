@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -107,6 +108,19 @@ def compare_facebook_candidates(previous_text, candidate_text, recent_candidates
         return True, "exact normalized match", ratio, False
     if previous_folded in candidate_folded or candidate_folded in previous_folded:
         return True, "one normalized candidate contains the other", ratio, False
+
+    # The post body is now stored in full instead of being cut at 900
+    # characters, so the same post can legitimately differ slightly between
+    # runs (a reaction count, an "Edited" tag, a late-loading trailing block).
+    # A matching opening plus a comparable length therefore still means the
+    # same post, not a new one.
+    previous_identity = facebook_body_identity(previous)
+    candidate_identity = facebook_body_identity(candidate)
+    if previous_identity and previous_identity == candidate_identity:
+        shorter, longer = sorted((len(previous_folded), len(candidate_folded)))
+        if longer - shorter <= max(120, int(longer * 0.25)):
+            return True, "identical post opening with comparable length", ratio, False
+
     if len(previous_folded) >= 24 and len(candidate_folded) >= 24 and ratio >= 0.92:
         return True, f"high text similarity ({ratio:.3f})", ratio, False
 
@@ -137,7 +151,7 @@ def find_gmail_sent_mailbox(imap_client):
         folder_line = raw_folder.decode("utf-8", errors="replace")
         if "\\Sent" in folder_line:
             # Preserve the final quoted IMAP mailbox name, including spaces;
-            # e.g. "[Gmail]/Sent Mail" rather than only its final word.
+            # e.g., "[Gmail]/Sent Mail" rather than only its final word.
             quoted_mailbox = re.search(r'("[^"]*")$', folder_line)
             if quoted_mailbox:
                 return quoted_mailbox.group(1)
@@ -408,13 +422,20 @@ def check_owndays(page, state):
 # -----------------------------------------------------------------------------
 # Facebook: compare clean post content and email once per new post
 # -----------------------------------------------------------------------------
-FACEBOOK_INTERFACE_MARKERS = (
-    "facebook",
-    "log in",
+# Chrome that can never be genuine post content, whatever the length.
+FACEBOOK_STRONG_MARKERS = (
     "create new account",
     "all reactions",
     "view more comments",
     "view more replies",
+)
+
+# Words that are interface text on a shell page but ordinary words inside a
+# real post ("...log in to redeem", a URL containing "facebook"). They only
+# disqualify a candidate that is short or made up mostly of such text.
+FACEBOOK_WEAK_MARKERS = (
+    "facebook",
+    "log in",
 )
 
 FACEBOOK_INTERFACE_ONLY = {
@@ -425,23 +446,175 @@ FACEBOOK_INTERFACE_ONLY = {
     "share",
 }
 
+# The post body is no longer cut short: an alert email should carry the whole
+# latest post. The cap only exists to keep one pathological post from
+# producing an unserious payload.
+FACEBOOK_CONTENT_LIMIT = 20000
+# state.json keeps a smaller copy so the repository cache stays reasonable.
+FACEBOOK_STATE_TEXT_LIMIT = 8000
+# Length of the normalized opening used to recognise the same post again.
+FACEBOOK_IDENTITY_CHARS = 220
+# How many trailing blocks a single post body may contribute (paragraphs,
+# sub-messages, quoted text) before we stop collecting.
+FACEBOOK_MAX_BLOCKS = 40
 
-def clean_facebook_post_text(raw_text):
-    """Remove Facebook's dynamic interface/reaction text from candidate content."""
-    text = raw_text.replace("See more", "").replace("See More", "")
-    text = re.sub(r"All reactions:.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+# A photo post can have an empty message container. Keep alerting on those by
+# describing the image instead of silently reporting UNVERIFIED.
+FACEBOOK_ALERT_ON_IMAGE_ONLY_POSTS = True
+
+MESSAGE_CONTAINER_SELECTORS = (
+    "div[data-ad-preview='message']",
+    "div[data-ad-comet-preview='message']",
+    "div[data-ad-rendering-role='story_message']",
+    "div[data-testid='post_message']",
+)
+
+MESSAGE_CONTAINER_SELECTOR_ALL = ", ".join(MESSAGE_CONTAINER_SELECTORS)
+
+POST_PERMALINK_RE = re.compile(
+    r"facebook\.com/.+(?:/posts/|story_fbid=|/photos/|/videos/|/reel/|permalink\.php|/activity/)",
+    re.IGNORECASE,
+)
+
+POST_PATH_RE = re.compile(
+    r"(?:/posts/|story_fbid=|/photos/|/videos/|/reel/|permalink\.php|/activity/)",
+    re.IGNORECASE,
+)
+
+# Emoji sprites, avatars and tiny thumbnails are interface parts of a post,
+# not its media.
+FACEBOOK_IMAGE_NOISE_RE = re.compile(
+    r"(?:/emoji/|static\.xx\.fbcdn\.net|s50x50|p50x50|s60x60|s40x40|cp0/|/rsrc\.php)",
+    re.IGNORECASE,
+)
+
+# Internal UI lines that must never be mistaken for post content.
+FACEBOOK_UI_LINE = re.compile(
+    r"^(?:like|comment|share|reply|follow|message|send|see more|see less|"
+    r"most relevant|all reactions?|write a comment|view \d+ (?:comments?|replies)|"
+    r"·|\d+\s*(?:s|m|h|d|w|y|min|mins|hr|hrs|hour|hours|day|days|week|weeks|year|years)|"
+    r"(?:yesterday|today|just now)(?:\s+at\s+[\d:apm. ]+)?|"
+    r"\d{1,2}\s+\w+\s+at\s+[\d:apm. ]+)$",
+    re.IGNORECASE,
+)
+
+# Walk the DOM and keep paragraph structure. innerText can omit text hidden by
+# CSS line clamping ("See more"), while textContent glues every block together
+# without separators. This keeps the full text and the original line breaks.
+BLOCK_TEXT_JS = """
+(element) => {
+  const blockTags = new Set([
+    "DIV","P","LI","TR","H1","H2","H3","H4","H5","H6","BLOCKQUOTE",
+    "SECTION","UL","OL","FIGURE","FIGCAPTION","TABLE"
+  ]);
+  const out = [];
+  const walk = (node) => {
+    if (!node) return;
+    if (node.nodeType === 3) { out.push(node.nodeValue); return; }
+    if (node.nodeType !== 1) return;
+    const tag = node.tagName;
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return;
+    if (tag === "BR") { out.push("\\n"); return; }
+    const isBlock = blockTags.has(tag);
+    if (isBlock) out.push("\\n");
+    for (const child of node.childNodes) walk(child);
+    if (isBlock) out.push("\\n");
+  };
+  walk(element);
+  return out.join("");
+}
+"""
+
+# Facebook limits how much of a long post is shown until "See more" is used.
+# Clicking every visible control is safe: it only expands already loaded text.
+EXPAND_SEE_MORE_JS = """
+() => {
+  let clicked = 0;
+  // Never touch anchors: a "See more" link can navigate away from the post
+  // and leave the extraction reading a different page.
+  const nodes = document.querySelectorAll("[role='button'], div, span");
+  for (const node of nodes) {
+    if (node.tagName === "A" || node.closest("a")) continue;
+    const label = (node.textContent || "").trim();
+    if (!/^(see more|see all|…\\s*see more|see more…)$/i.test(label)) continue;
+    const rect = node.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    try { node.click(); clicked += 1; } catch (error) { /* ignore */ }
+    if (clicked >= 5) break;
+  }
+  return clicked;
+}
+"""
+
+
+def normalize_facebook_whitespace(text):
+    """Collapse runs of spaces but keep paragraph breaks intact."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u200b", "").replace("\u00ad", "").replace("\u00a0", " ")
+    lines = []
+    for raw_line in text.split("\n"):
+        line = " ".join(raw_line.split())
+        if line:
+            lines.append(line)
+        elif lines and lines[-1] != "":
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def clean_facebook_post_text(raw_text, limit=FACEBOOK_CONTENT_LIMIT):
+    """Return the full post body without Facebook's interface/reaction chrome."""
+    text = raw_text or ""
+    # "See more" / "See less" are expand controls, not content. Only standalone
+    # occurrences and trailing ellipsis forms are removed so that a sentence
+    # which legitimately mentions the words is preserved.
+    text = re.sub(r"(?m)^\s*(?:see|show)\s+(?:more|less)\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:…|\.\.\.)\s*(?:see|show)\s+more\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?m)[ \t]+(?:see|show)\s+more\s*$", "", text, flags=re.IGNORECASE)
+
+    # Everything below the engagement bar belongs to the interface, comments
+    # or other posts, never to the post body itself.
+    text = re.sub(r"\n?All reactions:?.*", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\bLike\s+Comment(?:\s+Share)?\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\bView more(?: comments| replies)?\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
-    return shorten(text, 900)
+
+    kept_lines = []
+    for line in normalize_facebook_whitespace(text).split("\n"):
+        if not line:
+            kept_lines.append("")
+            continue
+        if FACEBOOK_UI_LINE.match(line.strip()):
+            continue
+        kept_lines.append(line)
+
+    cleaned = normalize_facebook_whitespace("\n".join(kept_lines))
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit].rstrip() + "\n\n[post text truncated at the configured limit]"
+    return cleaned
+
+
+def facebook_body_identity(text, limit=FACEBOOK_IDENTITY_CHARS):
+    """A short normalized opening used to recognise a post across runs."""
+    normalized = " ".join(clean_facebook_post_text(text).casefold().split())
+    return normalized[:limit]
 
 
 def is_clean_facebook_candidate(text):
     """Accept only meaningful post-body candidates, never generic Facebook UI text."""
-    normalized = shorten(text, 900)
+    normalized = clean_facebook_post_text(text)
     lowered = normalized.casefold()
     if len(normalized) < 5:
         return False
-    if any(marker in lowered for marker in FACEBOOK_INTERFACE_MARKERS):
+    if any(marker in lowered for marker in FACEBOOK_STRONG_MARKERS):
+        return False
+
+    # A logged-out shell is made almost entirely of these words; a real post
+    # that happens to mention them is long and contains far more besides.
+    weak_hits = sum(lowered.count(marker) for marker in FACEBOOK_WEAK_MARKERS)
+    if weak_hits and len(normalized) < 120:
+        return False
+    if weak_hits and weak_hits * 30 > len(normalized):
+        return False
+    if any(lowered.strip() == marker for marker in FACEBOOK_WEAK_MARKERS):
         return False
     if lowered in FACEBOOK_INTERFACE_ONLY:
         return False
@@ -467,52 +640,302 @@ def combine_facebook_blocks(blocks, page_identifier=""):
             continue
         kept = [existing for existing in kept if existing not in candidate]
         kept.append(candidate)
+        if len(kept) >= FACEBOOK_MAX_BLOCKS:
+            break
 
-    return shorten(" ".join(kept), 900)
+    return clean_facebook_post_text("\n\n".join(kept))
 
 
-def facebook_post_is_unchanged(previous_text, candidate_text):
-    """Treat a cleaner rendering of the saved post as unchanged, not as a new post."""
-    previous = clean_facebook_post_text(previous_text).casefold()
-    candidate = clean_facebook_post_text(candidate_text).casefold()
-    return bool(previous and candidate and (previous == candidate or previous in candidate or candidate in previous))
+def expand_facebook_see_more(page):
+    """Expand truncated post text so the whole body is present in the DOM."""
+    try:
+        clicked = page.evaluate(EXPAND_SEE_MORE_JS)
+        if clicked:
+            page.wait_for_timeout(600)
+        return int(clicked or 0)
+    except Exception:
+        return 0
+
+
+def facebook_page_identifier(page_url):
+    """Derive the handle to look for in author/permalink links."""
+    try:
+        parts = urlsplit(page_url)
+    except Exception:
+        return ""
+    slug = parts.path.rstrip("/").rsplit("/", 1)[-1]
+    if slug.casefold() in ("", "profile.php", "people"):
+        query = dict(parse_qsl(parts.query))
+        return (query.get("id") or "").strip()
+    return slug
+
+
+def article_links_to_page(article, identifier):
+    """True when an article carries a link back to the watched page."""
+    if not identifier:
+        return False
+    try:
+        hrefs = article.locator("a[href]").evaluate_all(
+            "(elements) => elements.map((element) => element.getAttribute('href') || '')"
+        )
+    except Exception:
+        return False
+    key = identifier.casefold()
+    for href in hrefs:
+        lowered = href.casefold()
+        if f"/{key}/" in lowered or lowered.rstrip("/").endswith(f"/{key}") or f"id={key}" in lowered:
+            return True
+    return False
+
+
+def find_latest_facebook_post(page, page_url=""):
+    """Return the newest post container belonging to the watched page.
+
+    Only articles that actually hold a message container are considered, so a
+    comment (which can also be an article) is never mistaken for the post. A
+    sponsored or "suggested for you" card can also carry a message container,
+    so an article that links back to the watched page is preferred; when no
+    article links back, the first message-bearing article is used as before.
+    """
+    try:
+        articles = page.locator("div[role='article']")
+        count = min(articles.count(), 8)
+    except Exception:
+        count = 0
+
+    identifier = facebook_page_identifier(page_url)
+    first_candidate = None
+    for index in range(count):
+        article = articles.nth(index)
+        try:
+            if article.locator(MESSAGE_CONTAINER_SELECTOR_ALL).count() == 0:
+                continue
+        except Exception:
+            continue
+        if first_candidate is None:
+            first_candidate = (article, f"article[{index}]")
+        if article_links_to_page(article, identifier):
+            return article, f"article[{index}]"
+
+    return first_candidate or (page, "page")
+
+
+def read_facebook_block_text(locator):
+    """Read one message container with paragraph breaks preserved."""
+    try:
+        text = locator.evaluate(BLOCK_TEXT_JS)
+    except Exception:
+        try:
+            text = locator.inner_text()
+        except Exception:
+            text = locator.text_content() or ""
+    return normalize_facebook_whitespace(text)
 
 
 def extract_facebook_post_text(page, page_url):
-    """Read the first clean, post-scoped text candidate across Facebook layouts."""
-    diagnostics = {}
+    """Read the newest post's full body across Facebook layout variants."""
+    diagnostics = {"scope": "page", "see_more_clicks": expand_facebook_see_more(page)}
     page_identifier = page_url.rstrip("/").rsplit("/", 1)[-1]
-    sources = [
-        (
-            "data-ad-comet-preview",
-            page.locator("div[data-ad-comet-preview='message'] :is(div, span)[dir='auto']"),
-        ),
-        (
-            "data-ad-preview",
-            page.locator("div[data-ad-preview='message'] :is(div, span)[dir='auto']"),
-        ),
-    ]
 
-    # A generic role=article fallback is intentionally unsafe: Facebook uses
-    # that role for individual comments and replies as well as posts. The
-    # previous article_2 fallback therefore mistook the commenter “San Lee”
-    # for a new page post. Only explicit message containers may trigger an
-    # alert; a missing message container remains an UNVERIFIED result.
-    diagnostics["article_fallback"] = "disabled: comments/replies can also be articles"
+    scope, scope_name = find_latest_facebook_post(page, page_url)
+    diagnostics["scope"] = scope_name
 
-    for source_name, locator in sources:
+    blocks = []
+    for selector in MESSAGE_CONTAINER_SELECTORS:
         try:
-            block_count = locator.count()
-            diagnostics[source_name] = block_count
-            if block_count == 0:
-                continue
-            combined = combine_facebook_blocks(locator.all_inner_texts(), page_identifier)
-            if is_clean_facebook_candidate(combined):
-                return combined, source_name, diagnostics
+            locators = scope.locator(selector)
+            block_count = locators.count()
         except Exception as exc:
-            diagnostics[source_name] = f"read error: {type(exc).__name__}"
+            diagnostics[selector] = f"read error: {type(exc).__name__}"
+            continue
+        diagnostics[selector] = block_count
+        if block_count == 0:
+            continue
+        for index in range(min(block_count, FACEBOOK_MAX_BLOCKS)):
+            try:
+                blocks.append(read_facebook_block_text(locators.nth(index)))
+            except Exception:
+                continue
 
+    diagnostics["raw_blocks"] = len(blocks)
+    combined = combine_facebook_blocks(blocks, page_identifier)
+    diagnostics["clean_characters"] = len(combined)
+    if is_clean_facebook_candidate(combined):
+        return combined, f"{scope_name}+message-containers", diagnostics
     return "", "", diagnostics
+
+
+def clean_facebook_permalink(url):
+    """Drop Facebook's tracking parameters so the link stays readable and short."""
+    try:
+        parts = urlsplit(url)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=False)
+            if not key.startswith("__")
+        ]
+        cleaned = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+        return cleaned if len(cleaned) > 12 else url
+    except Exception:
+        return url
+
+
+def describe_facebook_post(scope):
+    """Collect the post permalink, author, timestamp and attachments."""
+    details = {"permalink": "", "author": "", "posted": "", "links": [], "images": []}
+
+    try:
+        anchors = scope.locator("a[href]").evaluate_all(
+            "(elements) => elements.map((element) => [element.href, "
+            "(element.getAttribute('href') || ''), "
+            "(element.textContent || '').trim()])"
+        )
+    except Exception:
+        anchors = []
+
+    for href, raw_href, label in anchors:
+        if not details["permalink"]:
+            if POST_PERMALINK_RE.search(href or ""):
+                details["permalink"] = clean_facebook_permalink(href)
+            elif raw_href and POST_PATH_RE.search(raw_href):
+                # Relative permalinks are common in the compressed mobile
+                # render; resolve them against the canonical host.
+                details["permalink"] = clean_facebook_permalink(
+                    "https://www.facebook.com"
+                    + (raw_href if raw_href.startswith("/") else "/" + raw_href)
+                )
+        cleaned_label = shorten(label, 80)
+        if cleaned_label and not details["posted"] and re.fullmatch(
+            r"(?:\d+\s*(?:m|h|d|w|y|mins?|hrs?|hours?|days?|weeks?)|"
+            r"(?:yesterday|today)(?:\s+at\s+[\d:apm. ]+)?|"
+            r"\d{1,2}\s+\w+\s+at\s+[\d:apm. ]+)",
+            cleaned_label,
+            re.IGNORECASE,
+        ):
+            details["posted"] = cleaned_label
+
+    try:
+        author = scope.locator("h2 a, h3 a, h4 a, strong a").first.inner_text(timeout=2000)
+        details["author"] = shorten(author, 120)
+    except Exception:
+        pass
+
+    try:
+        datetime_value = scope.locator("time").first.get_attribute("datetime", timeout=2000)
+        if datetime_value:
+            details["posted"] = f"{details['posted']} ({datetime_value})".strip()
+    except Exception:
+        pass
+
+    try:
+        images = scope.locator("img[src]").evaluate_all(
+            "(elements) => elements.map((element) => [element.src, "
+            "(element.alt || '').trim()])"
+        )
+    except Exception:
+        images = []
+    for src, alt in images:
+        # Only real post media: skip emoji sprites, avatars and 50px
+        # thumbnails, which are part of the interface rather than the post.
+        if not src or not re.search(r"scontent", src or "", re.IGNORECASE):
+            continue
+        if FACEBOOK_IMAGE_NOISE_RE.search(src):
+            continue
+        alt = shorten(alt, 200)
+        if alt.casefold() in {"", "no photo description available.", "may be an image of text"}:
+            alt = ""
+        entry = {"url": src, "description": alt}
+        if entry["url"] not in [item["url"] for item in details["images"]]:
+            details["images"].append(entry)
+        if len(details["images"]) >= 4:
+            break
+
+    return details
+
+
+def photo_only_post_text(scope, details):
+    """Describe a media post that carries no caption text."""
+    if not FACEBOOK_ALERT_ON_IMAGE_ONLY_POSTS:
+        return ""
+    try:
+        if scope.locator(MESSAGE_CONTAINER_SELECTOR_ALL).count() == 0:
+            return ""
+    except Exception:
+        return ""
+
+    images = details.get("images") or []
+    if not images:
+        return ""
+
+    described = [image["description"] for image in images if image.get("description")]
+    lines = ["[Photo or video post with no caption text]"]
+    if described:
+        lines.extend(["", "What the image shows (Facebook's own description):"])
+        lines.extend(described)
+    else:
+        lines.extend(["", f"The post carries {len(images)} attached image(s); see the post link."])
+    return "\n".join(lines)
+
+
+def collect_links_in_text(text):
+    """Return external links written inside the post body, in order."""
+    links = []
+    for match in re.findall(r"https?://[^\s<>\"']+", text or ""):
+        cleaned = match.rstrip(").,;\"'")
+        if cleaned not in links and "facebook.com" not in cleaned.casefold():
+            links.append(cleaned)
+    return links[:10]
+
+
+def build_facebook_email_body(base_url, final_text, details):
+    """Assemble the alert body so the email carries as much of the post as possible."""
+    lines = [
+        "New Facebook post detected.",
+        "",
+        f"Page: {base_url}",
+    ]
+    if details.get("permalink"):
+        lines.append(f"Post: {details['permalink']}")
+    if details.get("author"):
+        lines.append(f"Author (as shown): {details['author']}")
+    if details.get("posted"):
+        lines.append(f"Posted: {details['posted']}")
+    lines.extend(
+        [
+            f"Characters captured: {len(final_text)}",
+            f"Checked: {get_hk_time()}",
+            "",
+            "-" * 60,
+            "POST CONTENT",
+            "-" * 60,
+            "",
+            final_text,
+            "",
+        ]
+    )
+
+    body_links = collect_links_in_text(final_text)
+    if body_links:
+        lines.extend(["-" * 60, "LINKS INSIDE THE POST", "-" * 60, ""])
+        lines.extend(body_links)
+        lines.append("")
+
+    if details.get("images"):
+        lines.extend(["-" * 60, "IMAGES / ATTACHMENTS", "-" * 60, ""])
+        for index, image in enumerate(details["images"], start=1):
+            headline = image.get("description") or "(no description provided)"
+            lines.append(f"{index}. {headline}")
+            lines.append(f"   {image['url']}")
+        lines.append("")
+
+    lines.extend(
+        [
+            "-" * 60,
+            "Note: text is copied from the public page render; media is linked,",
+            "not embedded. Open the post link above for the original layout.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def wait_for_facebook_post_text(page, page_url, attempts=5, interval_ms=3000):
@@ -526,7 +949,14 @@ def wait_for_facebook_post_text(page, page_url, attempts=5, interval_ms=3000):
             return final_text, source, diagnostics
         last_diagnostics = diagnostics
         if attempt < attempts:
-            page.wait_for_timeout(interval_ms)
+            # A short scroll nudges Facebook into hydrating the timeline.
+            try:
+                page.mouse.wheel(0, 400)
+                page.wait_for_timeout(interval_ms // 2)
+                page.mouse.wheel(0, -400)
+                page.wait_for_timeout(interval_ms // 2)
+            except Exception:
+                page.wait_for_timeout(interval_ms)
     return "", "", last_diagnostics
 
 
@@ -547,8 +977,8 @@ def check_facebook(page, url, state):
         page.locator("body").wait_for(state="visible", timeout=15000)
 
         # Facebook often returns the public profile shell first and hydrates the
-        # feed afterwards. Retry extraction for a bounded 12 seconds rather
-        # than accepting that first shell as the final page state.
+        # feed afterwards. Retry extraction for a bounded window rather than
+        # accepting that first shell as the final page state.
         initial_visible_text = page.locator("body").inner_text(timeout=15000)
         if page_looks_blocked(page, initial_visible_text):
             update_fetch_details(monitor, response, page, initial_visible_text, base_url)
@@ -565,15 +995,32 @@ def check_facebook(page, url, state):
             "source": extraction_source or "none",
             "selector_counts": extraction_diagnostics,
         }
-        monitor["candidate_post_text"] = final_text
+        scope, _ = find_latest_facebook_post(page, base_url)
+        post_details = describe_facebook_post(scope)
+
         if not final_text:
-            monitor["status"] = "UNVERIFIED: No clean post-body text found across Facebook layout selectors; prior post state preserved"
-            log_event(
-                state,
-                "FACEBOOK",
-                f"No clean latest-post text found for {base_url}; selector counts: {extraction_diagnostics}",
-            )
-            return state
+            # A photo-only post has an empty message container. Rather than
+            # reporting UNVERIFIED forever, describe what the image shows.
+            fallback_text = photo_only_post_text(scope, post_details)
+            if fallback_text:
+                final_text = fallback_text
+                monitor["extraction"]["source"] = "photo-only-fallback"
+                log_event(
+                    state,
+                    "FACEBOOK",
+                    f"No caption text for {base_url}; using the image description of a photo-only post.",
+                )
+            else:
+                monitor["candidate_post_text"] = ""
+                monitor["status"] = "UNVERIFIED: No clean post-body text found across Facebook layout selectors; prior post state preserved"
+                log_event(
+                    state,
+                    "FACEBOOK",
+                    f"No clean latest-post text found for {base_url}; selector counts: {extraction_diagnostics}",
+                )
+                return state
+
+        monitor["candidate_post_text"] = final_text[:FACEBOOK_STATE_TEXT_LIMIT]
 
         previous_text = monitor.get("last_post_text", "")
         previous_fingerprint = facebook_candidate_fingerprint(previous_text) if previous_text else ""
@@ -592,6 +1039,7 @@ def check_facebook(page, url, state):
             "candidate_fingerprint": candidate_fingerprint,
             "previous_candidate": shorten(previous_text, 300),
             "latest_candidate": shorten(final_text, 300),
+            "candidate_characters": len(final_text),
             "previously_alerted": previously_alerted,
         }
         monitor["candidate_history"].append(
@@ -599,6 +1047,7 @@ def check_facebook(page, url, state):
                 "observed_at": get_hk_time(),
                 "fingerprint": candidate_fingerprint,
                 "candidate": shorten(final_text, 300),
+                "characters": len(final_text),
                 "alerted": False,
                 "comparison_reason": comparison_reason,
             }
@@ -616,16 +1065,16 @@ def check_facebook(page, url, state):
             return state
 
         page_name = base_url.rsplit("/", 1)[-1]
+        headline = shorten(final_text, 90)
         success = send_email(
-            f"[NEW FB POST] {page_name}",
-            f"New Facebook post detected.\n\n"
-            f"Page: {base_url}\n\n"
-            f"Content:\n{final_text}\n\n"
-            f"Checked: {get_hk_time()}",
+            f"[NEW FB POST] {page_name}: {headline}" if headline else f"[NEW FB POST] {page_name}",
+            build_facebook_email_body(base_url, final_text, post_details),
         )
         if success:
             # Write new content only after email succeeds; failed sends retry next run.
-            monitor["last_post_text"] = final_text
+            monitor["last_post_text"] = final_text[:FACEBOOK_STATE_TEXT_LIMIT]
+            monitor["last_post_characters"] = len(final_text)
+            monitor["last_post_permalink"] = post_details.get("permalink", "")
             for item in reversed(monitor["candidate_history"]):
                 if item["fingerprint"] == candidate_fingerprint:
                     item["alerted"] = True
@@ -634,15 +1083,16 @@ def check_facebook(page, url, state):
             log_event(
                 state,
                 "FACEBOOK",
-                f"New-post email sent for {base_url}; previous={shorten(previous_text, 160)!r}; "
-                f"latest={shorten(final_text, 160)!r}; fingerprint={candidate_fingerprint}",
+                f"New-post email sent for {base_url}; {len(final_text)} characters extracted; "
+                f"previous={shorten(previous_text, 160)!r}; latest={shorten(final_text, 160)!r}; "
+                f"fingerprint={candidate_fingerprint}",
             )
         else:
             monitor["status"] = "EMAIL FAILED: New post detected; will retry next run"
             log_event(state, "FACEBOOK", f"New post detected but email failed for {base_url}.")
 
     except Exception as exc:
-        monitor["status"] = f"ERROR: Facebook fetch/check failed; prior post state preserved ({str(exc)[:120]})"
+        monitor["status"] = f"ERROR: Facebook fetch/check failed; prior state preserved ({str(exc)[:120]})"
         log_event(state, "FACEBOOK", monitor["status"])
 
     return state
@@ -683,7 +1133,8 @@ def main():
 
             # Images, media, and fonts are not needed for text/button checks.
             # Blocking them reduces transfer and startup time without changing
-            # the monitored DOM conditions.
+            # the monitored DOM conditions. (Image URLs are read from the DOM,
+            # so attachment links still work even when the file is not loaded.)
             context.route(
                 "**/*",
                 lambda route: route.abort()

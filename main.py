@@ -888,54 +888,22 @@ def collect_links_in_text(text):
 
 
 def build_facebook_email_body(base_url, final_text, details):
-    """Assemble the alert body so the email carries as much of the post as possible."""
-    lines = [
-        "New Facebook post detected.",
-        "",
-        f"Page: {base_url}",
-    ]
-    if details.get("permalink"):
-        lines.append(f"Post: {details['permalink']}")
-    if details.get("author"):
-        lines.append(f"Author (as shown): {details['author']}")
-    if details.get("posted"):
-        lines.append(f"Posted: {details['posted']}")
-    lines.extend(
+    """Build the compact Facebook email requested by the user.
+
+    Keep only the page, raw captured post body, posted time, and check time.
+    The raw body may still contain URLs that Facebook included in the post.
+    """
+    posted = details.get("posted") or "Unavailable"
+    return "\n".join(
         [
-            f"Characters captured: {len(final_text)}",
-            f"Checked: {get_hk_time()}",
-            "",
-            "-" * 60,
-            "POST CONTENT",
-            "-" * 60,
+            f"Page: {base_url}",
             "",
             final_text,
             "",
+            f"posted: {posted}",
+            f"Checked: {get_hk_time()}",
         ]
     )
-
-    body_links = collect_links_in_text(final_text)
-    if body_links:
-        lines.extend(["-" * 60, "LINKS INSIDE THE POST", "-" * 60, ""])
-        lines.extend(body_links)
-        lines.append("")
-
-    if details.get("images"):
-        lines.extend(["-" * 60, "IMAGES / ATTACHMENTS", "-" * 60, ""])
-        for index, image in enumerate(details["images"], start=1):
-            headline = image.get("description") or "(no description provided)"
-            lines.append(f"{index}. {headline}")
-            lines.append(f"   {image['url']}")
-        lines.append("")
-
-    lines.extend(
-        [
-            "-" * 60,
-            "Note: text is copied from the public page render; media is linked,",
-            "not embedded. Open the post link above for the original layout.",
-        ]
-    )
-    return "\n".join(lines)
 
 
 def wait_for_facebook_post_text(page, page_url, attempts=5, interval_ms=3000):
@@ -1067,7 +1035,7 @@ def check_facebook(page, url, state):
         page_name = base_url.rsplit("/", 1)[-1]
         headline = shorten(final_text, 90)
         success = send_email(
-            f"[NEW FB POST] {page_name}: {headline}" if headline else f"[NEW FB POST] {page_name}",
+            f"{page_name}: {headline}" if headline else page_name,
             build_facebook_email_body(base_url, final_text, post_details),
         )
         if success:

@@ -94,13 +94,28 @@ def facebook_candidate_fingerprint(text):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
-def compare_facebook_candidates(previous_text, candidate_text, recent_candidates=None):
-    """Explain whether two renderings represent the same text-based post."""
+def compare_facebook_candidates(
+    previous_text,
+    candidate_text,
+    recent_candidates=None,
+    previous_permalink="",
+    candidate_permalink="",
+):
+    """Explain whether two renderings represent the same Facebook post.
+
+    The permalink is the strongest identity signal. The same post can render
+    once as only its first line plus "See more" and later as the full body, so
+    text equality alone is not sufficient.
+    """
     previous = clean_facebook_post_text(previous_text)
     candidate = clean_facebook_post_text(candidate_text)
     previous_folded = previous.casefold()
     candidate_folded = candidate.casefold()
     ratio = SequenceMatcher(None, previous_folded, candidate_folded).ratio() if previous_folded and candidate_folded else 0.0
+
+    if previous_permalink and candidate_permalink:
+        if clean_facebook_permalink(previous_permalink).casefold() == clean_facebook_permalink(candidate_permalink).casefold():
+            return True, "same Facebook post permalink", ratio, False
 
     if not previous_folded:
         return False, "no previous candidate", ratio, False
@@ -120,6 +135,17 @@ def compare_facebook_candidates(previous_text, candidate_text, recent_candidates
         shorter, longer = sorted((len(previous_folded), len(candidate_folded)))
         if longer - shorter <= max(120, int(longer * 0.25)):
             return True, "identical post opening with comparable length", ratio, False
+
+    # A collapsed "See more" rendering may contain only a short opening. If
+    # no permalink was available, suppress a later expanded rendering when
+    # the complete shorter candidate is the same opening after removing the
+    # visual ellipsis.
+    previous_opening = facebook_short_opening(previous)
+    candidate_opening = facebook_short_opening(candidate)
+    if previous_opening and candidate_opening and (
+        previous_opening in candidate_opening or candidate_opening in previous_opening
+    ):
+        return True, "same post opening across collapsed/expanded rendering", ratio, False
 
     if len(previous_folded) >= 24 and len(candidate_folded) >= 24 and ratio >= 0.92:
         return True, f"high text similarity ({ratio:.3f})", ratio, False
@@ -598,6 +624,13 @@ def facebook_body_identity(text, limit=FACEBOOK_IDENTITY_CHARS):
     return normalized[:limit]
 
 
+def facebook_short_opening(text, limit=48):
+    """Normalize the short opening exposed before Facebook's See more control."""
+    normalized = " ".join(clean_facebook_post_text(text).casefold().split())
+    normalized = re.sub(r"(?:…|\.\.\.)\s*$", "", normalized).strip()
+    return normalized[:limit].rstrip(" .,;:!?…")
+
+
 def is_clean_facebook_candidate(text):
     """Accept only meaningful post-body candidates, never generic Facebook UI text."""
     normalized = clean_facebook_post_text(text)
@@ -991,12 +1024,16 @@ def check_facebook(page, url, state):
         monitor["candidate_post_text"] = final_text[:FACEBOOK_STATE_TEXT_LIMIT]
 
         previous_text = monitor.get("last_post_text", "")
+        previous_permalink = monitor.get("last_post_permalink", "")
+        candidate_permalink = post_details.get("permalink", "")
         previous_fingerprint = facebook_candidate_fingerprint(previous_text) if previous_text else ""
         candidate_fingerprint = facebook_candidate_fingerprint(final_text)
         unchanged, comparison_reason, similarity, previously_alerted = compare_facebook_candidates(
             previous_text,
             final_text,
             monitor.get("candidate_history", []),
+            previous_permalink,
+            candidate_permalink,
         )
         monitor["comparison"] = {
             "checked_at": get_hk_time(),
@@ -1005,6 +1042,8 @@ def check_facebook(page, url, state):
             "similarity": round(similarity, 3),
             "previous_fingerprint": previous_fingerprint,
             "candidate_fingerprint": candidate_fingerprint,
+            "previous_permalink": previous_permalink,
+            "candidate_permalink": candidate_permalink,
             "previous_candidate": shorten(previous_text, 300),
             "latest_candidate": shorten(final_text, 300),
             "candidate_characters": len(final_text),

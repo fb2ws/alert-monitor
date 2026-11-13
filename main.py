@@ -9,8 +9,12 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import make_msgid
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from email.utils import make_msgid, parsedate_to_datetime
+from html import unescape
+from html.parser import HTMLParser
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+import xml.etree.ElementTree as ET
 
 from playwright.sync_api import sync_playwright
 
@@ -23,6 +27,11 @@ RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
 # Opt-in only. Set GitHub repository variable CLEAN_SENT_ALERTS=true to remove
 # the Sent label from each alert after confirmed SMTP delivery.
 CLEAN_SENT_ALERTS = os.environ.get("CLEAN_SENT_ALERTS", "false").lower() == "true"
+
+EPRICE_RSS_URL = "https://www.eprice.com.hk/news/rss.xml"
+EPRICE_BOOTSTRAP_ALERT = os.environ.get("EPRICE_BOOTSTRAP_ALERT", "false").lower() == "true"
+EPRICE_MAX_SAVED_GUIDS = 100
+EPRICE_HTTP_TIMEOUT = 30
 
 
 def load_facebook_pages():
@@ -94,28 +103,13 @@ def facebook_candidate_fingerprint(text):
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
-def compare_facebook_candidates(
-    previous_text,
-    candidate_text,
-    recent_candidates=None,
-    previous_permalink="",
-    candidate_permalink="",
-):
-    """Explain whether two renderings represent the same Facebook post.
-
-    The permalink is the strongest identity signal. The same post can render
-    once as only its first line plus "See more" and later as the full body, so
-    text equality alone is not sufficient.
-    """
+def compare_facebook_candidates(previous_text, candidate_text, recent_candidates=None):
+    """Explain whether two renderings represent the same text-based post."""
     previous = clean_facebook_post_text(previous_text)
     candidate = clean_facebook_post_text(candidate_text)
     previous_folded = previous.casefold()
     candidate_folded = candidate.casefold()
     ratio = SequenceMatcher(None, previous_folded, candidate_folded).ratio() if previous_folded and candidate_folded else 0.0
-
-    if previous_permalink and candidate_permalink:
-        if clean_facebook_permalink(previous_permalink).casefold() == clean_facebook_permalink(candidate_permalink).casefold():
-            return True, "same Facebook post permalink", ratio, False
 
     if not previous_folded:
         return False, "no previous candidate", ratio, False
@@ -123,30 +117,6 @@ def compare_facebook_candidates(
         return True, "exact normalized match", ratio, False
     if previous_folded in candidate_folded or candidate_folded in previous_folded:
         return True, "one normalized candidate contains the other", ratio, False
-
-    # The post body is now stored in full instead of being cut at 900
-    # characters, so the same post can legitimately differ slightly between
-    # runs (a reaction count, an "Edited" tag, a late-loading trailing block).
-    # A matching opening plus a comparable length therefore still means the
-    # same post, not a new one.
-    previous_identity = facebook_body_identity(previous)
-    candidate_identity = facebook_body_identity(candidate)
-    if previous_identity and previous_identity == candidate_identity:
-        shorter, longer = sorted((len(previous_folded), len(candidate_folded)))
-        if longer - shorter <= max(120, int(longer * 0.25)):
-            return True, "identical post opening with comparable length", ratio, False
-
-    # A collapsed "See more" rendering may contain only a short opening. If
-    # no permalink was available, suppress a later expanded rendering when
-    # the complete shorter candidate is the same opening after removing the
-    # visual ellipsis.
-    previous_opening = facebook_short_opening(previous)
-    candidate_opening = facebook_short_opening(candidate)
-    if previous_opening and candidate_opening and (
-        previous_opening in candidate_opening or candidate_opening in previous_opening
-    ):
-        return True, "same post opening across collapsed/expanded rendering", ratio, False
-
     if len(previous_folded) >= 24 and len(candidate_folded) >= 24 and ratio >= 0.92:
         return True, f"high text similarity ({ratio:.3f})", ratio, False
 
@@ -177,7 +147,7 @@ def find_gmail_sent_mailbox(imap_client):
         folder_line = raw_folder.decode("utf-8", errors="replace")
         if "\\Sent" in folder_line:
             # Preserve the final quoted IMAP mailbox name, including spaces;
-            # e.g., "[Gmail]/Sent Mail" rather than only its final word.
+            # e.g. "[Gmail]/Sent Mail" rather than only its final word.
             quoted_mailbox = re.search(r'("[^"]*")$', folder_line)
             if quoted_mailbox:
                 return quoted_mailbox.group(1)
@@ -273,6 +243,7 @@ def load_state():
         "monitors": {
             "owndays": {},
             "fb": {},
+            "eprice": {},
         },
         "history": [],
     }
@@ -288,6 +259,7 @@ def load_state():
     state.setdefault("history", [])
     state["monitors"].setdefault("owndays", {})
     state["monitors"].setdefault("fb", {})
+    state["monitors"].setdefault("eprice", {})
     state["monitors"].pop("levis", None)  # Retired permanently.
     state["system"].setdefault("total_runs", 0)
     state["system"]["timezone"] = "Asia/Hong_Kong (UTC+8)"
@@ -448,20 +420,13 @@ def check_owndays(page, state):
 # -----------------------------------------------------------------------------
 # Facebook: compare clean post content and email once per new post
 # -----------------------------------------------------------------------------
-# Chrome that can never be genuine post content, whatever the length.
-FACEBOOK_STRONG_MARKERS = (
+FACEBOOK_INTERFACE_MARKERS = (
+    "facebook",
+    "log in",
     "create new account",
     "all reactions",
     "view more comments",
     "view more replies",
-)
-
-# Words that are interface text on a shell page but ordinary words inside a
-# real post ("...log in to redeem", a URL containing "facebook"). They only
-# disqualify a candidate that is short or made up mostly of such text.
-FACEBOOK_WEAK_MARKERS = (
-    "facebook",
-    "log in",
 )
 
 FACEBOOK_INTERFACE_ONLY = {
@@ -472,182 +437,23 @@ FACEBOOK_INTERFACE_ONLY = {
     "share",
 }
 
-# The post body is no longer cut short: an alert email should carry the whole
-# latest post. The cap only exists to keep one pathological post from
-# producing an unserious payload.
-FACEBOOK_CONTENT_LIMIT = 20000
-# state.json keeps a smaller copy so the repository cache stays reasonable.
-FACEBOOK_STATE_TEXT_LIMIT = 8000
-# Length of the normalized opening used to recognise the same post again.
-FACEBOOK_IDENTITY_CHARS = 220
-# How many trailing blocks a single post body may contribute (paragraphs,
-# sub-messages, quoted text) before we stop collecting.
-FACEBOOK_MAX_BLOCKS = 40
 
-# A photo post can have an empty message container. Keep alerting on those by
-# describing the image instead of silently reporting UNVERIFIED.
-FACEBOOK_ALERT_ON_IMAGE_ONLY_POSTS = True
-
-MESSAGE_CONTAINER_SELECTORS = (
-    "div[data-ad-preview='message']",
-    "div[data-ad-comet-preview='message']",
-    "div[data-ad-rendering-role='story_message']",
-    "div[data-testid='post_message']",
-)
-
-MESSAGE_CONTAINER_SELECTOR_ALL = ", ".join(MESSAGE_CONTAINER_SELECTORS)
-
-POST_PERMALINK_RE = re.compile(
-    r"facebook\.com/.+(?:/posts/|story_fbid=|/photos/|/videos/|/reel/|permalink\.php|/activity/)",
-    re.IGNORECASE,
-)
-
-POST_PATH_RE = re.compile(
-    r"(?:/posts/|story_fbid=|/photos/|/videos/|/reel/|permalink\.php|/activity/)",
-    re.IGNORECASE,
-)
-
-# Emoji sprites, avatars and tiny thumbnails are interface parts of a post,
-# not its media.
-FACEBOOK_IMAGE_NOISE_RE = re.compile(
-    r"(?:/emoji/|static\.xx\.fbcdn\.net|s50x50|p50x50|s60x60|s40x40|cp0/|/rsrc\.php)",
-    re.IGNORECASE,
-)
-
-# Internal UI lines that must never be mistaken for post content.
-FACEBOOK_UI_LINE = re.compile(
-    r"^(?:like|comment|share|reply|follow|message|send|see more|see less|"
-    r"most relevant|all reactions?|write a comment|view \d+ (?:comments?|replies)|"
-    r"·|\d+\s*(?:s|m|h|d|w|y|min|mins|hr|hrs|hour|hours|day|days|week|weeks|year|years)|"
-    r"(?:yesterday|today|just now)(?:\s+at\s+[\d:apm. ]+)?|"
-    r"\d{1,2}\s+\w+\s+at\s+[\d:apm. ]+)$",
-    re.IGNORECASE,
-)
-
-# Walk the DOM and keep paragraph structure. innerText can omit text hidden by
-# CSS line clamping ("See more"), while textContent glues every block together
-# without separators. This keeps the full text and the original line breaks.
-BLOCK_TEXT_JS = """
-(element) => {
-  const blockTags = new Set([
-    "DIV","P","LI","TR","H1","H2","H3","H4","H5","H6","BLOCKQUOTE",
-    "SECTION","UL","OL","FIGURE","FIGCAPTION","TABLE"
-  ]);
-  const out = [];
-  const walk = (node) => {
-    if (!node) return;
-    if (node.nodeType === 3) { out.push(node.nodeValue); return; }
-    if (node.nodeType !== 1) return;
-    const tag = node.tagName;
-    if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return;
-    if (tag === "BR") { out.push("\\n"); return; }
-    const isBlock = blockTags.has(tag);
-    if (isBlock) out.push("\\n");
-    for (const child of node.childNodes) walk(child);
-    if (isBlock) out.push("\\n");
-  };
-  walk(element);
-  return out.join("");
-}
-"""
-
-# Facebook limits how much of a long post is shown until "See more" is used.
-# Clicking every visible control is safe: it only expands already loaded text.
-EXPAND_SEE_MORE_JS = """
-() => {
-  let clicked = 0;
-  // Never touch anchors: a "See more" link can navigate away from the post
-  // and leave the extraction reading a different page.
-  const nodes = document.querySelectorAll("[role='button'], div, span");
-  for (const node of nodes) {
-    if (node.tagName === "A" || node.closest("a")) continue;
-    const label = (node.textContent || "").trim();
-    if (!/^(see more|see all|…\\s*see more|see more…)$/i.test(label)) continue;
-    const rect = node.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) continue;
-    try { node.click(); clicked += 1; } catch (error) { /* ignore */ }
-    if (clicked >= 5) break;
-  }
-  return clicked;
-}
-"""
-
-
-def normalize_facebook_whitespace(text):
-    """Collapse runs of spaces but keep paragraph breaks intact."""
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\u200b", "").replace("\u00ad", "").replace("\u00a0", " ")
-    lines = []
-    for raw_line in text.split("\n"):
-        line = " ".join(raw_line.split())
-        if line:
-            lines.append(line)
-        elif lines and lines[-1] != "":
-            lines.append("")
-    return "\n".join(lines).strip()
-
-
-def clean_facebook_post_text(raw_text, limit=FACEBOOK_CONTENT_LIMIT):
-    """Return the full post body without Facebook's interface/reaction chrome."""
-    text = raw_text or ""
-    # "See more" / "See less" are expand controls, not content. Only standalone
-    # occurrences and trailing ellipsis forms are removed so that a sentence
-    # which legitimately mentions the words is preserved.
-    text = re.sub(r"(?m)^\s*(?:see|show)\s+(?:more|less)\s*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?:…|\.\.\.)\s*(?:see|show)\s+more\s*$", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?m)[ \t]+(?:see|show)\s+more\s*$", "", text, flags=re.IGNORECASE)
-
-    # Everything below the engagement bar belongs to the interface, comments
-    # or other posts, never to the post body itself.
-    text = re.sub(r"\n?All reactions:?.*", "", text, flags=re.IGNORECASE | re.DOTALL)
+def clean_facebook_post_text(raw_text):
+    """Remove Facebook's dynamic interface/reaction text from candidate content."""
+    text = raw_text.replace("See more", "").replace("See More", "")
+    text = re.sub(r"All reactions:.*", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\bLike\s+Comment(?:\s+Share)?\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"\bView more(?: comments| replies)?\b.*", "", text, flags=re.IGNORECASE | re.DOTALL)
-
-    kept_lines = []
-    for line in normalize_facebook_whitespace(text).split("\n"):
-        if not line:
-            kept_lines.append("")
-            continue
-        if FACEBOOK_UI_LINE.match(line.strip()):
-            continue
-        kept_lines.append(line)
-
-    cleaned = normalize_facebook_whitespace("\n".join(kept_lines))
-    if len(cleaned) > limit:
-        cleaned = cleaned[:limit].rstrip() + "\n\n[post text truncated at the configured limit]"
-    return cleaned
-
-
-def facebook_body_identity(text, limit=FACEBOOK_IDENTITY_CHARS):
-    """A short normalized opening used to recognise a post across runs."""
-    normalized = " ".join(clean_facebook_post_text(text).casefold().split())
-    return normalized[:limit]
-
-
-def facebook_short_opening(text, limit=48):
-    """Normalize the short opening exposed before Facebook's See more control."""
-    normalized = " ".join(clean_facebook_post_text(text).casefold().split())
-    normalized = re.sub(r"(?:…|\.\.\.)\s*$", "", normalized).strip()
-    return normalized[:limit].rstrip(" .,;:!?…")
+    return shorten(text, 900)
 
 
 def is_clean_facebook_candidate(text):
     """Accept only meaningful post-body candidates, never generic Facebook UI text."""
-    normalized = clean_facebook_post_text(text)
+    normalized = shorten(text, 900)
     lowered = normalized.casefold()
     if len(normalized) < 5:
         return False
-    if any(marker in lowered for marker in FACEBOOK_STRONG_MARKERS):
-        return False
-
-    # A logged-out shell is made almost entirely of these words; a real post
-    # that happens to mention them is long and contains far more besides.
-    weak_hits = sum(lowered.count(marker) for marker in FACEBOOK_WEAK_MARKERS)
-    if weak_hits and len(normalized) < 120:
-        return False
-    if weak_hits and weak_hits * 30 > len(normalized):
-        return False
-    if any(lowered.strip() == marker for marker in FACEBOOK_WEAK_MARKERS):
+    if any(marker in lowered for marker in FACEBOOK_INTERFACE_MARKERS):
         return False
     if lowered in FACEBOOK_INTERFACE_ONLY:
         return False
@@ -673,270 +479,52 @@ def combine_facebook_blocks(blocks, page_identifier=""):
             continue
         kept = [existing for existing in kept if existing not in candidate]
         kept.append(candidate)
-        if len(kept) >= FACEBOOK_MAX_BLOCKS:
-            break
 
-    return clean_facebook_post_text("\n\n".join(kept))
+    return shorten(" ".join(kept), 900)
 
 
-def expand_facebook_see_more(page):
-    """Expand truncated post text so the whole body is present in the DOM."""
-    try:
-        clicked = page.evaluate(EXPAND_SEE_MORE_JS)
-        if clicked:
-            page.wait_for_timeout(600)
-        return int(clicked or 0)
-    except Exception:
-        return 0
-
-
-def facebook_page_identifier(page_url):
-    """Derive the handle to look for in author/permalink links."""
-    try:
-        parts = urlsplit(page_url)
-    except Exception:
-        return ""
-    slug = parts.path.rstrip("/").rsplit("/", 1)[-1]
-    if slug.casefold() in ("", "profile.php", "people"):
-        query = dict(parse_qsl(parts.query))
-        return (query.get("id") or "").strip()
-    return slug
-
-
-def article_links_to_page(article, identifier):
-    """True when an article carries a link back to the watched page."""
-    if not identifier:
-        return False
-    try:
-        hrefs = article.locator("a[href]").evaluate_all(
-            "(elements) => elements.map((element) => element.getAttribute('href') || '')"
-        )
-    except Exception:
-        return False
-    key = identifier.casefold()
-    for href in hrefs:
-        lowered = href.casefold()
-        if f"/{key}/" in lowered or lowered.rstrip("/").endswith(f"/{key}") or f"id={key}" in lowered:
-            return True
-    return False
-
-
-def find_latest_facebook_post(page, page_url=""):
-    """Return the newest post container belonging to the watched page.
-
-    Only articles that actually hold a message container are considered, so a
-    comment (which can also be an article) is never mistaken for the post. A
-    sponsored or "suggested for you" card can also carry a message container,
-    so an article that links back to the watched page is preferred; when no
-    article links back, the first message-bearing article is used as before.
-    """
-    try:
-        articles = page.locator("div[role='article']")
-        count = min(articles.count(), 8)
-    except Exception:
-        count = 0
-
-    identifier = facebook_page_identifier(page_url)
-    first_candidate = None
-    for index in range(count):
-        article = articles.nth(index)
-        try:
-            if article.locator(MESSAGE_CONTAINER_SELECTOR_ALL).count() == 0:
-                continue
-        except Exception:
-            continue
-        if first_candidate is None:
-            first_candidate = (article, f"article[{index}]")
-        if article_links_to_page(article, identifier):
-            return article, f"article[{index}]"
-
-    return first_candidate or (page, "page")
-
-
-def read_facebook_block_text(locator):
-    """Read one message container with paragraph breaks preserved."""
-    try:
-        text = locator.evaluate(BLOCK_TEXT_JS)
-    except Exception:
-        try:
-            text = locator.inner_text()
-        except Exception:
-            text = locator.text_content() or ""
-    return normalize_facebook_whitespace(text)
+def facebook_post_is_unchanged(previous_text, candidate_text):
+    """Treat a cleaner rendering of the saved post as unchanged, not as a new post."""
+    previous = clean_facebook_post_text(previous_text).casefold()
+    candidate = clean_facebook_post_text(candidate_text).casefold()
+    return bool(previous and candidate and (previous == candidate or previous in candidate or candidate in previous))
 
 
 def extract_facebook_post_text(page, page_url):
-    """Read the newest post's full body across Facebook layout variants."""
-    diagnostics = {"scope": "page", "see_more_clicks": expand_facebook_see_more(page)}
+    """Read the first clean, post-scoped text candidate across Facebook layouts."""
+    diagnostics = {}
     page_identifier = page_url.rstrip("/").rsplit("/", 1)[-1]
+    sources = [
+        (
+            "data-ad-comet-preview",
+            page.locator("div[data-ad-comet-preview='message'] :is(div, span)[dir='auto']"),
+        ),
+        (
+            "data-ad-preview",
+            page.locator("div[data-ad-preview='message'] :is(div, span)[dir='auto']"),
+        ),
+    ]
 
-    scope, scope_name = find_latest_facebook_post(page, page_url)
-    diagnostics["scope"] = scope_name
+    # A generic role=article fallback is intentionally unsafe: Facebook uses
+    # that role for individual comments and replies as well as posts. The
+    # previous article_2 fallback therefore mistook the commenter “San Lee”
+    # for a new page post. Only explicit message containers may trigger an
+    # alert; a missing message container remains an UNVERIFIED result.
+    diagnostics["article_fallback"] = "disabled: comments/replies can also be articles"
 
-    blocks = []
-    for selector in MESSAGE_CONTAINER_SELECTORS:
+    for source_name, locator in sources:
         try:
-            locators = scope.locator(selector)
-            block_count = locators.count()
-        except Exception as exc:
-            diagnostics[selector] = f"read error: {type(exc).__name__}"
-            continue
-        diagnostics[selector] = block_count
-        if block_count == 0:
-            continue
-        for index in range(min(block_count, FACEBOOK_MAX_BLOCKS)):
-            try:
-                blocks.append(read_facebook_block_text(locators.nth(index)))
-            except Exception:
+            block_count = locator.count()
+            diagnostics[source_name] = block_count
+            if block_count == 0:
                 continue
+            combined = combine_facebook_blocks(locator.all_inner_texts(), page_identifier)
+            if is_clean_facebook_candidate(combined):
+                return combined, source_name, diagnostics
+        except Exception as exc:
+            diagnostics[source_name] = f"read error: {type(exc).__name__}"
 
-    diagnostics["raw_blocks"] = len(blocks)
-    combined = combine_facebook_blocks(blocks, page_identifier)
-    diagnostics["clean_characters"] = len(combined)
-    if is_clean_facebook_candidate(combined):
-        return combined, f"{scope_name}+message-containers", diagnostics
     return "", "", diagnostics
-
-
-def clean_facebook_permalink(url):
-    """Drop Facebook's tracking parameters so the link stays readable and short."""
-    try:
-        parts = urlsplit(url)
-        query = [
-            (key, value)
-            for key, value in parse_qsl(parts.query, keep_blank_values=False)
-            if not key.startswith("__")
-        ]
-        cleaned = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
-        return cleaned if len(cleaned) > 12 else url
-    except Exception:
-        return url
-
-
-def describe_facebook_post(scope):
-    """Collect the post permalink, author, timestamp and attachments."""
-    details = {"permalink": "", "author": "", "posted": "", "links": [], "images": []}
-
-    try:
-        anchors = scope.locator("a[href]").evaluate_all(
-            "(elements) => elements.map((element) => [element.href, "
-            "(element.getAttribute('href') || ''), "
-            "(element.textContent || '').trim()])"
-        )
-    except Exception:
-        anchors = []
-
-    for href, raw_href, label in anchors:
-        if not details["permalink"]:
-            if POST_PERMALINK_RE.search(href or ""):
-                details["permalink"] = clean_facebook_permalink(href)
-            elif raw_href and POST_PATH_RE.search(raw_href):
-                # Relative permalinks are common in the compressed mobile
-                # render; resolve them against the canonical host.
-                details["permalink"] = clean_facebook_permalink(
-                    "https://www.facebook.com"
-                    + (raw_href if raw_href.startswith("/") else "/" + raw_href)
-                )
-        cleaned_label = shorten(label, 80)
-        if cleaned_label and not details["posted"] and re.fullmatch(
-            r"(?:\d+\s*(?:m|h|d|w|y|mins?|hrs?|hours?|days?|weeks?)|"
-            r"(?:yesterday|today)(?:\s+at\s+[\d:apm. ]+)?|"
-            r"\d{1,2}\s+\w+\s+at\s+[\d:apm. ]+)",
-            cleaned_label,
-            re.IGNORECASE,
-        ):
-            details["posted"] = cleaned_label
-
-    try:
-        author = scope.locator("h2 a, h3 a, h4 a, strong a").first.inner_text(timeout=2000)
-        details["author"] = shorten(author, 120)
-    except Exception:
-        pass
-
-    try:
-        datetime_value = scope.locator("time").first.get_attribute("datetime", timeout=2000)
-        if datetime_value:
-            details["posted"] = f"{details['posted']} ({datetime_value})".strip()
-    except Exception:
-        pass
-
-    try:
-        images = scope.locator("img[src]").evaluate_all(
-            "(elements) => elements.map((element) => [element.src, "
-            "(element.alt || '').trim()])"
-        )
-    except Exception:
-        images = []
-    for src, alt in images:
-        # Only real post media: skip emoji sprites, avatars and 50px
-        # thumbnails, which are part of the interface rather than the post.
-        if not src or not re.search(r"scontent", src or "", re.IGNORECASE):
-            continue
-        if FACEBOOK_IMAGE_NOISE_RE.search(src):
-            continue
-        alt = shorten(alt, 200)
-        if alt.casefold() in {"", "no photo description available.", "may be an image of text"}:
-            alt = ""
-        entry = {"url": src, "description": alt}
-        if entry["url"] not in [item["url"] for item in details["images"]]:
-            details["images"].append(entry)
-        if len(details["images"]) >= 4:
-            break
-
-    return details
-
-
-def photo_only_post_text(scope, details):
-    """Describe a media post that carries no caption text."""
-    if not FACEBOOK_ALERT_ON_IMAGE_ONLY_POSTS:
-        return ""
-    try:
-        if scope.locator(MESSAGE_CONTAINER_SELECTOR_ALL).count() == 0:
-            return ""
-    except Exception:
-        return ""
-
-    images = details.get("images") or []
-    if not images:
-        return ""
-
-    described = [image["description"] for image in images if image.get("description")]
-    lines = ["[Photo or video post with no caption text]"]
-    if described:
-        lines.extend(["", "What the image shows (Facebook's own description):"])
-        lines.extend(described)
-    else:
-        lines.extend(["", f"The post carries {len(images)} attached image(s); see the post link."])
-    return "\n".join(lines)
-
-
-def collect_links_in_text(text):
-    """Return external links written inside the post body, in order."""
-    links = []
-    for match in re.findall(r"https?://[^\s<>\"']+", text or ""):
-        cleaned = match.rstrip(").,;\"'")
-        if cleaned not in links and "facebook.com" not in cleaned.casefold():
-            links.append(cleaned)
-    return links[:10]
-
-
-def build_facebook_email_body(base_url, final_text, details):
-    """Build the compact Facebook email requested by the user.
-
-    Keep only the page, raw captured post body, posted time, and check time.
-    The raw body may still contain URLs that Facebook included in the post.
-    """
-    posted = details.get("posted") or "Unavailable"
-    return "\n".join(
-        [
-            f"Page: {base_url}",
-            "",
-            final_text,
-            "",
-            f"posted: {posted}",
-            f"Checked: {get_hk_time()}",
-        ]
-    )
 
 
 def wait_for_facebook_post_text(page, page_url, attempts=5, interval_ms=3000):
@@ -950,14 +538,7 @@ def wait_for_facebook_post_text(page, page_url, attempts=5, interval_ms=3000):
             return final_text, source, diagnostics
         last_diagnostics = diagnostics
         if attempt < attempts:
-            # A short scroll nudges Facebook into hydrating the timeline.
-            try:
-                page.mouse.wheel(0, 400)
-                page.wait_for_timeout(interval_ms // 2)
-                page.mouse.wheel(0, -400)
-                page.wait_for_timeout(interval_ms // 2)
-            except Exception:
-                page.wait_for_timeout(interval_ms)
+            page.wait_for_timeout(interval_ms)
     return "", "", last_diagnostics
 
 
@@ -978,8 +559,8 @@ def check_facebook(page, url, state):
         page.locator("body").wait_for(state="visible", timeout=15000)
 
         # Facebook often returns the public profile shell first and hydrates the
-        # feed afterwards. Retry extraction for a bounded window rather than
-        # accepting that first shell as the final page state.
+        # feed afterwards. Retry extraction for a bounded 12 seconds rather
+        # than accepting that first shell as the final page state.
         initial_visible_text = page.locator("body").inner_text(timeout=15000)
         if page_looks_blocked(page, initial_visible_text):
             update_fetch_details(monitor, response, page, initial_visible_text, base_url)
@@ -996,44 +577,23 @@ def check_facebook(page, url, state):
             "source": extraction_source or "none",
             "selector_counts": extraction_diagnostics,
         }
-        scope, _ = find_latest_facebook_post(page, base_url)
-        post_details = describe_facebook_post(scope)
-
+        monitor["candidate_post_text"] = final_text
         if not final_text:
-            # A photo-only post has an empty message container. Rather than
-            # reporting UNVERIFIED forever, describe what the image shows.
-            fallback_text = photo_only_post_text(scope, post_details)
-            if fallback_text:
-                final_text = fallback_text
-                monitor["extraction"]["source"] = "photo-only-fallback"
-                log_event(
-                    state,
-                    "FACEBOOK",
-                    f"No caption text for {base_url}; using the image description of a photo-only post.",
-                )
-            else:
-                monitor["candidate_post_text"] = ""
-                monitor["status"] = "UNVERIFIED: No clean post-body text found across Facebook layout selectors; prior post state preserved"
-                log_event(
-                    state,
-                    "FACEBOOK",
-                    f"No clean latest-post text found for {base_url}; selector counts: {extraction_diagnostics}",
-                )
-                return state
-
-        monitor["candidate_post_text"] = final_text[:FACEBOOK_STATE_TEXT_LIMIT]
+            monitor["status"] = "UNVERIFIED: No clean post-body text found across Facebook layout selectors; prior post state preserved"
+            log_event(
+                state,
+                "FACEBOOK",
+                f"No clean latest-post text found for {base_url}; selector counts: {extraction_diagnostics}",
+            )
+            return state
 
         previous_text = monitor.get("last_post_text", "")
-        previous_permalink = monitor.get("last_post_permalink", "")
-        candidate_permalink = post_details.get("permalink", "")
         previous_fingerprint = facebook_candidate_fingerprint(previous_text) if previous_text else ""
         candidate_fingerprint = facebook_candidate_fingerprint(final_text)
         unchanged, comparison_reason, similarity, previously_alerted = compare_facebook_candidates(
             previous_text,
             final_text,
             monitor.get("candidate_history", []),
-            previous_permalink,
-            candidate_permalink,
         )
         monitor["comparison"] = {
             "checked_at": get_hk_time(),
@@ -1042,11 +602,8 @@ def check_facebook(page, url, state):
             "similarity": round(similarity, 3),
             "previous_fingerprint": previous_fingerprint,
             "candidate_fingerprint": candidate_fingerprint,
-            "previous_permalink": previous_permalink,
-            "candidate_permalink": candidate_permalink,
             "previous_candidate": shorten(previous_text, 300),
             "latest_candidate": shorten(final_text, 300),
-            "candidate_characters": len(final_text),
             "previously_alerted": previously_alerted,
         }
         monitor["candidate_history"].append(
@@ -1054,7 +611,6 @@ def check_facebook(page, url, state):
                 "observed_at": get_hk_time(),
                 "fingerprint": candidate_fingerprint,
                 "candidate": shorten(final_text, 300),
-                "characters": len(final_text),
                 "alerted": False,
                 "comparison_reason": comparison_reason,
             }
@@ -1072,16 +628,16 @@ def check_facebook(page, url, state):
             return state
 
         page_name = base_url.rsplit("/", 1)[-1]
-        headline = shorten(final_text, 90)
         success = send_email(
-            f"{page_name}: {headline}" if headline else page_name,
-            build_facebook_email_body(base_url, final_text, post_details),
+            f"[NEW FB POST] {page_name}",
+            f"New Facebook post detected.\n\n"
+            f"Page: {base_url}\n\n"
+            f"Content:\n{final_text}\n\n"
+            f"Checked: {get_hk_time()}",
         )
         if success:
             # Write new content only after email succeeds; failed sends retry next run.
-            monitor["last_post_text"] = final_text[:FACEBOOK_STATE_TEXT_LIMIT]
-            monitor["last_post_characters"] = len(final_text)
-            monitor["last_post_permalink"] = post_details.get("permalink", "")
+            monitor["last_post_text"] = final_text
             for item in reversed(monitor["candidate_history"]):
                 if item["fingerprint"] == candidate_fingerprint:
                     item["alerted"] = True
@@ -1090,16 +646,15 @@ def check_facebook(page, url, state):
             log_event(
                 state,
                 "FACEBOOK",
-                f"New-post email sent for {base_url}; {len(final_text)} characters extracted; "
-                f"previous={shorten(previous_text, 160)!r}; latest={shorten(final_text, 160)!r}; "
-                f"fingerprint={candidate_fingerprint}",
+                f"New-post email sent for {base_url}; previous={shorten(previous_text, 160)!r}; "
+                f"latest={shorten(final_text, 160)!r}; fingerprint={candidate_fingerprint}",
             )
         else:
             monitor["status"] = "EMAIL FAILED: New post detected; will retry next run"
             log_event(state, "FACEBOOK", f"New post detected but email failed for {base_url}.")
 
     except Exception as exc:
-        monitor["status"] = f"ERROR: Facebook fetch/check failed; prior state preserved ({str(exc)[:120]})"
+        monitor["status"] = f"ERROR: Facebook fetch/check failed; prior post state preserved ({str(exc)[:120]})"
         log_event(state, "FACEBOOK", monitor["status"])
 
     return state
@@ -1122,6 +677,8 @@ def main():
     state["system"]["total_runs"] += 1
     log_event(state, "SYSTEM", f"Monitoring cycle {state['system']['total_runs']} started.")
 
+    state = check_eprice_rss(state)
+
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
@@ -1140,8 +697,7 @@ def main():
 
             # Images, media, and fonts are not needed for text/button checks.
             # Blocking them reduces transfer and startup time without changing
-            # the monitored DOM conditions. (Image URLs are read from the DOM,
-            # so attachment links still work even when the file is not loaded.)
+            # the monitored DOM conditions.
             context.route(
                 "**/*",
                 lambda route: route.abort()
@@ -1170,6 +726,302 @@ def main():
     print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
     print("--- END STATE REPORT ---\n", flush=True)
 
+
+
+# -----------------------------------------------------------------------------
+# ePrice: RSS detection plus full article retrieval
+# -----------------------------------------------------------------------------
+class ArticleTextParser(HTMLParser):
+    """Extract readable text from an ePrice article body without third-party packages."""
+
+    BLOCK_TAGS = {
+        "address", "article", "blockquote", "br", "dd", "div", "dl", "dt",
+        "h1", "h2", "h3", "h4", "h5", "h6", "li", "ol", "p", "pre",
+        "section", "table", "td", "th", "tr", "ul",
+    }
+    IGNORED_TAGS = {"script", "style", "noscript", "svg"}
+
+    def __init__(self, prefer_itemprop=True):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.depth = 0
+        self.target_depth = None
+        self.ignored_depth = 0
+        self.prefer_itemprop = prefer_itemprop
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.casefold()
+        attrs = dict(attrs)
+        self.depth += 1
+        if tag in self.IGNORED_TAGS:
+            self.ignored_depth += 1
+            return
+        if attrs.get("itemprop", "").casefold() == "articlebody":
+            # Prefer the precise articleBody element even when it is nested
+            # inside a larger <article> card containing author/navigation text.
+            self.target_depth = self.depth
+        elif self.target_depth is None and not self.prefer_itemprop and tag == "article":
+            self.target_depth = self.depth
+        if self.target_depth is not None and self.ignored_depth == 0 and tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag.casefold() == "br" and self.target_depth is not None:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.casefold()
+        if tag in self.IGNORED_TAGS and self.ignored_depth:
+            self.ignored_depth -= 1
+        if self.target_depth is not None and self.ignored_depth == 0 and tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+        self.depth = max(0, self.depth - 1)
+        if self.target_depth is not None and self.depth < self.target_depth:
+            self.target_depth = None
+
+    def handle_data(self, data):
+        if self.target_depth is not None and self.ignored_depth == 0:
+            self.parts.append(data)
+
+
+def clean_article_text(raw_text):
+    """Normalize article HTML text while preserving paragraph breaks."""
+    text = unescape(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    for raw_line in text.split("\n"):
+        line = " ".join(raw_line.split())
+        if line:
+            lines.append(line)
+        elif lines and lines[-1] != "":
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def html_to_text(raw_html):
+    """Convert a small HTML fragment such as RSS CDATA to readable text."""
+    parser = ArticleTextParser(prefer_itemprop=False)
+    try:
+        parser.feed(raw_html or "")
+        parser.close()
+        text = "".join(parser.parts)
+        if text.strip():
+            return clean_article_text(text)
+    except Exception:
+        pass
+
+    # RSS descriptions are generally simple HTML. This fallback prevents a
+    # malformed inline tag from destroying an otherwise useful notification.
+    return clean_article_text(re.sub(r"<[^>]+>", " ", raw_html or ""))
+
+
+def eprice_http_get(url, headers=None):
+    """Fetch a URL with a polite, identifiable, bounded request."""
+    request_headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; ePriceMonitor/1.0; +https://github.com/)",
+        "Accept": "application/rss+xml, application/xml, text/xml, text/html;q=0.9, */*;q=0.8",
+    }
+    request_headers.update(headers or {})
+    request = Request(url, headers=request_headers)
+    with urlopen(request, timeout=EPRICE_HTTP_TIMEOUT) as response:
+        return response.status, response.headers, response.read()
+
+
+def xml_child_text(element, name):
+    """Read an RSS child while tolerating XML namespaces."""
+    for child in list(element):
+        if child.tag.rsplit("}", 1)[-1].casefold() == name.casefold():
+            return "".join(child.itertext()).strip()
+    return ""
+
+
+def parse_eprice_rss(payload):
+    """Parse the official ePrice RSS feed into newest-first item dictionaries."""
+    root = ET.fromstring(payload)
+    items = []
+    for item in root.iter():
+        if item.tag.rsplit("}", 1)[-1].casefold() != "item":
+            continue
+        title = html_to_text(xml_child_text(item, "title"))
+        link = xml_child_text(item, "link")
+        guid = xml_child_text(item, "guid") or link
+        summary = html_to_text(xml_child_text(item, "description"))
+        pub_date = xml_child_text(item, "pubDate")
+        enclosure_url = ""
+        for child in list(item):
+            if child.tag.rsplit("}", 1)[-1].casefold() == "enclosure":
+                enclosure_url = child.attrib.get("url", "")
+                break
+        if guid and link and title:
+            items.append(
+                {
+                    "guid": guid.strip(),
+                    "title": title,
+                    "link": link.strip(),
+                    "summary": summary,
+                    "pub_date": pub_date.strip(),
+                    "image_url": enclosure_url,
+                }
+            )
+    return items
+
+
+def fetch_eprice_article(item):
+    """Fetch and extract the full article body, including the RSS introduction."""
+    status, headers, payload = eprice_http_get(item["link"])
+    if status != 200:
+        raise RuntimeError(f"article HTTP status {status}")
+
+    html = payload.decode("utf-8", errors="replace")
+    article_body = ""
+    # The live ePrice page marks the article body with itemprop=articleBody.
+    # Extract that section before parsing so a malformed/unclosed surrounding
+    # card cannot pull in the site's "latest news" footer.
+    body_match = re.search(
+        r"<(?P<tag>section|article|div)\b[^>]*\bitemprop\s*=\s*['\"]articleBody['\"][^>]*>",
+        html,
+        flags=re.IGNORECASE,
+    )
+    if body_match:
+        closing_tag = body_match.group("tag")
+        end_match = re.search(rf"</{closing_tag}\s*>", html[body_match.end():], flags=re.IGNORECASE)
+        fragment = html[body_match.end(): body_match.end() + end_match.start()] if end_match else html[body_match.end():]
+        article_body = html_to_text(f"<article>{fragment}</article>")
+
+    if not article_body:
+        parser = ArticleTextParser(prefer_itemprop=True)
+        parser.feed(html)
+        parser.close()
+        article_body = clean_article_text("".join(parser.parts))
+    summary = clean_article_text(item.get("summary", ""))
+
+    if article_body and summary:
+        body_folded = " ".join(article_body.casefold().split())
+        summary_folded = " ".join(summary.casefold().split())
+        if summary_folded in body_folded:
+            full_text = article_body
+        else:
+            full_text = f"{summary}\n\n{article_body}"
+    else:
+        full_text = article_body or summary
+
+    if not full_text:
+        raise RuntimeError("article body and RSS description were both empty")
+    return full_text, headers.get("Content-Type", "")
+
+
+def format_eprice_posted(item):
+    """Preserve the feed timestamp and add a normalized timestamp when possible."""
+    raw = item.get("pub_date", "") or "Unavailable"
+    try:
+        parsed = parsedate_to_datetime(raw)
+        return f"{raw} ({parsed.astimezone(HK_TZ).strftime('%Y-%m-%d %H:%M:%S HK')})"
+    except (TypeError, ValueError, OverflowError):
+        return raw
+
+
+def build_eprice_email(item, full_text, fetch_note=""):
+    """Build the full-article ePrice email body."""
+    lines = [
+        f"Article: {item['link']}",
+        "",
+        full_text,
+        "",
+        f"posted: {format_eprice_posted(item)}",
+        f"Checked: {get_hk_time()}",
+    ]
+    if fetch_note:
+        lines.extend(["", fetch_note])
+    return "\n".join(lines)
+
+
+def check_eprice_rss(state):
+    """Alert once for each new official ePrice RSS item."""
+    monitor = state["monitors"].setdefault("eprice", {})
+    monitor.setdefault("seen_guids", [])
+    monitor.setdefault("status", "Initializing")
+    monitor["last_check"] = get_hk_time()
+
+    conditional_headers = {}
+    if monitor.get("etag"):
+        conditional_headers["If-None-Match"] = monitor["etag"]
+    if monitor.get("last_modified"):
+        conditional_headers["If-Modified-Since"] = monitor["last_modified"]
+
+    try:
+        status, headers, payload = eprice_http_get(EPRICE_RSS_URL, conditional_headers)
+        monitor["fetch"] = {
+            "when": get_hk_time(),
+            "url": EPRICE_RSS_URL,
+            "http_status": status,
+            "content_type": headers.get("Content-Type", ""),
+            "bytes": len(payload),
+        }
+        monitor["etag"] = headers.get("ETag", monitor.get("etag", ""))
+        monitor["last_modified"] = headers.get("Last-Modified", monitor.get("last_modified", ""))
+        items = parse_eprice_rss(payload)
+        if not items:
+            raise RuntimeError("RSS feed contained no valid items")
+    except HTTPError as exc:
+        if exc.code == 304:
+            monitor["status"] = "OK: ePrice RSS unchanged (HTTP 304)"
+            log_event(state, "EPRICE", monitor["status"])
+            return state
+        monitor["status"] = f"ERROR: ePrice RSS HTTP {exc.code}; prior state preserved"
+        log_event(state, "EPRICE", monitor["status"])
+        return state
+    except (URLError, TimeoutError, ET.ParseError, OSError, RuntimeError) as exc:
+        monitor["status"] = f"ERROR: ePrice RSS fetch/parse failed; prior state preserved ({str(exc)[:160]})"
+        log_event(state, "EPRICE", monitor["status"])
+        return state
+
+    seen = set(monitor.get("seen_guids", []))
+    new_items = [item for item in reversed(items) if item["guid"] not in seen]
+    if not seen and not EPRICE_BOOTSTRAP_ALERT:
+        # Do not flood the inbox with the feed's existing history when this
+        # monitor is first enabled. The next newly published item alerts.
+        monitor["seen_guids"] = [item["guid"] for item in items[:EPRICE_MAX_SAVED_GUIDS]]
+        monitor["latest_guid"] = items[0]["guid"]
+        monitor["latest_title"] = items[0]["title"]
+        monitor["status"] = f"INITIALIZED: Saved {len(items)} existing ePrice RSS item(s); no email sent"
+        log_event(state, "EPRICE", monitor["status"])
+        return state
+
+    if not new_items:
+        monitor["status"] = "OK: ePrice RSS has no new articles"
+        log_event(state, "EPRICE", monitor["status"])
+        return state
+
+    sent_count = 0
+    for item in new_items:
+        full_text = item["summary"]
+        fetch_note = ""
+        try:
+            full_text, _ = fetch_eprice_article(item)
+        except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as exc:
+            # The RSS summary is still a valid notification fallback. The
+            # article URL is included so the full page remains one click away.
+            fetch_note = f"Full article fetch unavailable; RSS summary shown ({type(exc).__name__}: {str(exc)[:120]})."
+            log_event(state, "EPRICE", f"Full article fetch failed for {item['link']}; using RSS summary.")
+
+        subject = f"ePrice: {item['title']}"
+        success = send_email(subject, build_eprice_email(item, full_text, fetch_note))
+        if not success:
+            monitor["status"] = "EMAIL FAILED: ePrice article detected; will retry next run"
+            log_event(state, "EPRICE", f"Email failed for new article: {item['title']}")
+            break
+
+        seen.add(item["guid"])
+        sent_count += 1
+        monitor["latest_guid"] = item["guid"]
+        monitor["latest_title"] = item["title"]
+        monitor["latest_link"] = item["link"]
+        monitor["latest_characters"] = len(full_text)
+        log_event(state, "EPRICE", f"New article email sent; {len(full_text)} characters fetched: {item['title']}")
+
+    monitor["seen_guids"] = list(seen)[-EPRICE_MAX_SAVED_GUIDS:]
+    if sent_count:
+        monitor["status"] = f"ALERTING: {sent_count} new ePrice article email(s) sent"
+    return state
 
 if __name__ == "__main__":
     main()

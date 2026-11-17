@@ -40,7 +40,7 @@ STATE_PATH = Path(os.environ.get("YOUTUBE_STATE_FILE", "youtube_state.json"))
 BOOTSTRAP_ALERT = os.environ.get("YOUTUBE_BOOTSTRAP_ALERT", "false").lower() == "true"
 MAX_NEW_VIDEOS_PER_RUN = int(os.environ.get("YOUTUBE_MAX_NEW_PER_RUN", "3"))
 DISABLED_CHANNELS = {
-    value.strip().casefold()
+    value.strip().lstrip("@").casefold()
     for value in re.split(r"[\n,]", os.environ.get("YOUTUBE_DISABLED_CHANNELS", ""))
     if value.strip()
 }

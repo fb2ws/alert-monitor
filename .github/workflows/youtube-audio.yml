@@ -1,0 +1,59 @@
+name: YouTube audio alerts
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youtube-audio-alerts
+  cancel-in-progress: false
+
+jobs:
+  download-and-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install audio tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+          python -m pip install --disable-pip-version-check --no-cache-dir --upgrade yt-dlp
+
+      - name: Check the channel and send audio email
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          # Keep false on the first run so existing videos do not flood inbox.
+          YOUTUBE_BOOTSTRAP_ALERT: "false"
+          # Comma- or newline-separated channel names to pause, for example:
+          # YOUTUBE_DISABLED_CHANNELS: "HKLocalTV,Another channel"
+          YOUTUBE_DISABLED_CHANNELS: ""
+        run: python youtube_audio.py
+
+      - name: Persist YouTube delivery state
+        if: always()
+        run: |
+          if [ -z "$(git status --porcelain -- youtube_state.json)" ]; then
+            echo "No state change to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add youtube_state.json
+          git commit -m "chore: update YouTube audio delivery state"
+          git push

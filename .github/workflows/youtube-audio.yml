@@ -2,8 +2,8 @@ name: YouTube audio alerts
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"
+  repository_dispatch:
+    types: [trigger_monitor]
 
 permissions:
   contents: read

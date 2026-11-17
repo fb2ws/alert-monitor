@@ -31,6 +31,10 @@ CHANNELS = {
         "id": "UCzuzpkqcLSDmqnVpkksriow",
         "url": "https://www.youtube.com/@HKLocalTV/videos",
     },
+    "Qiage": {
+        "id": "UCwWgaLuFZBRB-dQQP7pxnbA",
+        "url": "https://www.youtube.com/@qiage/videos",
+    },
 }
 STATE_PATH = Path(os.environ.get("YOUTUBE_STATE_FILE", "youtube_state.json"))
 BOOTSTRAP_ALERT = os.environ.get("YOUTUBE_BOOTSTRAP_ALERT", "false").lower() == "true"
@@ -122,8 +126,6 @@ def run_command(args: list[str], timeout: int) -> None:
 def create_audio(video: dict, workdir: Path) -> Path:
     if not shutil.which("yt-dlp"):
         raise RuntimeError("yt-dlp is not installed")
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg is not installed")
 
     source_template = str(workdir / "source.%(ext)s")
     run_command(
@@ -134,7 +136,9 @@ def create_audio(video: dict, workdir: Path) -> Path:
             "--no-write-info-json",
             "--no-write-thumbnail",
             "--restrict-filenames",
-            "--format", "bestaudio/best",
+            # Keep the already-compressed YouTube audio stream. Prefer M4A for
+            # compatibility, then WebM. This avoids a full FFmpeg install.
+            "--format", "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio",
             "--output", source_template,
             video["url"],
         ],
@@ -144,19 +148,9 @@ def create_audio(video: dict, workdir: Path) -> Path:
     if len(sources) != 1:
         raise RuntimeError(f"expected one downloaded source, found {len(sources)}")
 
-    output = workdir / f"{safe_filename(video['title'])}.mp3"
-    # Speech-oriented, intentionally tiny output. 32 kbps mono keeps typical
-    # sub-30-minute episodes far below Gmail's 25 MB attachment limit.
-    run_command(
-        [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(sources[0]), "-vn", "-ac", "1", "-ar", "22050",
-            "-codec:a", "libmp3lame", "-b:a", "32k", str(output),
-        ],
-        10 * 60,
-    )
-    if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError("FFmpeg produced no audio file")
+    output = sources[0]
+    if output.stat().st_size == 0:
+        raise RuntimeError("yt-dlp produced an empty audio file")
     if output.stat().st_size > MAX_ATTACHMENT_BYTES:
         raise RuntimeError(f"audio is {output.stat().st_size} bytes, above the 24 MB safety limit")
     return output
@@ -181,12 +175,13 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
         f"Video: {video['url']}\n"
         f"Video ID: {video['id']}\n"
         f"Published: {published}\n\n"
-        "The compressed audio file is attached.\n"
-        "Format: MP3, mono, 32 kbps\n"
+        "The lowest-quality audio-only file is attached.\n"
+        f"Format: {audio_path.suffix.lstrip('.').upper()}\n"
     )
     message.attach(MIMEText(body, "plain", "utf-8"))
     with audio_path.open("rb") as audio_file:
-        attachment = MIMEApplication(audio_file.read(), _subtype="mpeg")
+        subtype = {".m4a": "mp4", ".webm": "webm"}.get(audio_path.suffix.lower(), "octet-stream")
+        attachment = MIMEApplication(audio_file.read(), _subtype=subtype)
     attachment.add_header("Content-Disposition", "attachment", filename=audio_path.name)
     message.attach(attachment)
 
@@ -202,7 +197,13 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
 
     channel_state = state["channels"].setdefault(channel_name, {"seen_ids": []})
     seen = set(channel_state.get("seen_ids", []))
-    unseen = [item for item in reversed(feed_items) if item["id"] not in seen]
+    if not seen and BOOTSTRAP_ALERT:
+        # Explicit test/opt-in mode: process the newest item first.
+        unseen = feed_items[:MAX_NEW_VIDEOS_PER_RUN]
+    else:
+        # Normal mode processes a backlog oldest-first so delivery order is
+        # chronological when more than one upload is waiting.
+        unseen = [item for item in reversed(feed_items) if item["id"] not in seen]
 
     if not seen and not BOOTSTRAP_ALERT:
         channel_state["seen_ids"] = [item["id"] for item in feed_items[:MAX_HISTORY]]

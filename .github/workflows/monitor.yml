@@ -74,21 +74,3 @@ jobs:
       with:
         path: state.json
         key: state-memory-${{ github.run_id }}
-
-    - name: Upload visible report
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: execution-report
-        path: state.json
-        retention-days: 7
-
-    - name: Print report to console
-      if: always()
-      run: |
-        if [ -f state.json ]; then
-          echo "--- LATEST LOGS ---"
-          cat state.json
-        else
-          echo "No state.json was created."
-        fi

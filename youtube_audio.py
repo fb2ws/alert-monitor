@@ -205,13 +205,15 @@ def video_skip_reason(metadata: dict) -> str | None:
 
 
 def is_youtube_bot_challenge(error: Exception) -> bool:
-    """Recognize only yt-dlp's explicit YouTube sign-in/bot challenge."""
+    """Recognize temporary YouTube access/status errors that should be retried."""
     text = str(error).casefold()
-    return (
+    bot_challenge = (
         "sign in to confirm" in text
         and "not a bot" in text
         and "youtube" in text
     )
+    scheduled_premiere = "premieres in" in text or "premiere in" in text
+    return bot_challenge or scheduled_premiere
 
 
 def create_audio(video: dict, workdir: Path) -> Path:
@@ -376,7 +378,8 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
                 save_state(state)
                 log(
                     f"{channel_name}: WARNING deferred {video['id']} because YouTube "
-                    "requested sign-in/bot verification; retry remains enabled; "
+                    "returned a temporary bot challenge or scheduled premiere status; "
+                    "retry remains enabled; "
                     "workflow will not be marked failed"
                 )
                 continue

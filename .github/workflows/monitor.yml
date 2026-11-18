@@ -35,11 +35,18 @@ jobs:
 
     - name: Install Python packages in the container
       run: |
+          python3 --version
+          python3 -m pip install \
+            --user \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            --retries 5 \
+            --index-url https://pypi.org/simple \
+            -r requirements.txt
         # Do not use actions/setup-python here: its Ubuntu 24.04 Python
         # requires GLIBC 2.38, while the version-matched browser image is
         # Ubuntu 22.04. Use the container's compatible Python instead.
-        python3 --version
-        python3 -m pip install --user --disable-pip-version-check -r requirements.txt
+        # python3 --version
 
     - name: Restore state memory
       uses: actions/cache/restore@v4

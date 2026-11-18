@@ -35,6 +35,11 @@ CHANNELS = {
         "id": "UCwWgaLuFZBRB-dQQP7pxnbA",
         "url": "https://www.youtube.com/@qiage/videos",
     },
+    "memeHongKong": {
+        "id": "UCu_YquoQYKR3GpP82TO-zRw",
+        "url": "https://www.youtube.com/@memehongkong/videos",
+        "title_contains": "蕭若元",
+    },
 }
 STATE_PATH = Path(os.environ.get("YOUTUBE_STATE_FILE", "youtube_state.json"))
 BOOTSTRAP_ALERT = os.environ.get("YOUTUBE_BOOTSTRAP_ALERT", "false").lower() == "true"
@@ -209,6 +214,35 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         channel_state["seen_ids"] = []
         log(f"{channel_name}: one-time reset requested; existing IDs will be re-evaluated")
     seen = set(channel_state.get("seen_ids", []))
+    initializing = not seen
+    title_filter = config.get("title_contains", "").strip()
+    matching = [
+        item for item in feed_items
+        if not title_filter or title_filter.casefold() in item["title"].casefold()
+    ]
+    skipped = [item for item in feed_items if item not in matching]
+    if title_filter:
+        log(f"{channel_name}: title filter={title_filter!r} | matched={len(matching)} | skipped={len(skipped)}")
+        # Remember non-matching uploads so they are not reconsidered and
+        # reported as skipped on every run. They never trigger an email.
+        skipped_new_ids = {item["id"] for item in skipped if item["id"] not in seen}
+        if skipped_new_ids:
+            seen.update(skipped_new_ids)
+            channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
+            channel_state["skipped_ids_count"] = channel_state.get("skipped_ids_count", 0) + len(skipped_new_ids)
+            save_state(state)
+
+    if initializing and not BOOTSTRAP_ALERT:
+        # First run is a baseline for every upload, including filtered-out
+        # videos. Do not email historical matches.
+        seen.update(item["id"] for item in feed_items)
+        channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
+        channel_state["latest_id"] = feed_items[0]["id"]
+        channel_state["latest_title"] = feed_items[0]["title"]
+        channel_state["status"] = f"initialized with {len(feed_items)} existing item(s); no email sent"
+        save_state(state)
+        log(f"{channel_name}: {channel_state['status']}")
+        return
     log(
         f"{channel_name}: feed={len(feed_items)} | latest={feed_items[0]['id']} "
         f"| {feed_items[0]['title']} | seen={len(seen)}"
@@ -219,15 +253,7 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     else:
         # Normal mode processes a backlog oldest-first so delivery order is
         # chronological when more than one upload is waiting.
-        unseen = [item for item in reversed(feed_items) if item["id"] not in seen]
-
-    if not seen and not BOOTSTRAP_ALERT:
-        channel_state["seen_ids"] = [item["id"] for item in feed_items[:MAX_HISTORY]]
-        channel_state["latest_id"] = feed_items[0]["id"]
-        channel_state["latest_title"] = feed_items[0]["title"]
-        channel_state["status"] = f"initialized with {len(feed_items)} existing item(s); no email sent"
-        log(f"{channel_name}: {channel_state['status']}")
-        return
+        unseen = [item for item in reversed(matching) if item["id"] not in seen]
 
     if not unseen:
         channel_state["status"] = "no new videos"

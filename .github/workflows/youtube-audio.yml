@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [trigger_monitor]
-    
+
 permissions:
   contents: read
 
@@ -27,12 +27,16 @@ jobs:
           python3 -m pip install --disable-pip-version-check --no-cache-dir --upgrade yt-dlp
 
       - name: Prepare optional YouTube cookies
-        if: ${{ secrets.YOUTUBE_COOKIES_B64 != '' }}
         env:
           YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
         run: |
-          printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > "$RUNNER_TEMP/youtube-cookies.txt"
-          chmod 600 "$RUNNER_TEMP/youtube-cookies.txt"
+          if [ -n "$YOUTUBE_COOKIES_B64" ]; then
+            printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > "$RUNNER_TEMP/youtube-cookies.txt"
+            chmod 600 "$RUNNER_TEMP/youtube-cookies.txt"
+            echo "YouTube cookie file prepared in the temporary runner."
+          else
+            echo "No YouTube cookie secret configured; continuing without cookies."
+          fi
 
       - name: Restore YouTube state
         uses: actions/cache/restore@v4

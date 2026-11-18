@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [trigger_monitor]
-
+    
 permissions:
   contents: read
 
@@ -22,10 +22,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install audio tools
+      - name: Install yt-dlp
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes ffmpeg
           python3 -m pip install --disable-pip-version-check --no-cache-dir --upgrade yt-dlp
 
       - name: Restore YouTube state
@@ -44,6 +42,8 @@ jobs:
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           # Repository variable. Example: HKLocalTV,AnotherChannel
           YOUTUBE_DISABLED_CHANNELS: ${{ vars.YOUTUBE_DISABLED_CHANNELS }}
+          # Temporary recovery switch; normally leave empty. Accepts Qiage or @qiage.
+          YOUTUBE_RESET_CHANNELS: ${{ vars.YOUTUBE_RESET_CHANNELS }}
           # Do not email existing videos during initial setup.
           YOUTUBE_BOOTSTRAP_ALERT: "false"
           # Process at most three backlog videos in one run.

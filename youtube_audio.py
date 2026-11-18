@@ -40,6 +40,11 @@ CHANNELS = {
         "url": "https://www.youtube.com/@memehongkong/videos",
         "title_contains": "蕭若元",
     },
+    "WhirlingCloudsValley": {
+        "id": "UCCVFgDdTfiGxQ695BxMBMUg",
+        "url": "https://www.youtube.com/@WhirlingCloudsValley/videos",
+        "title_excludes": "合集",
+    },
 }
 STATE_PATH = Path(os.environ.get("YOUTUBE_STATE_FILE", "youtube_state.json"))
 BOOTSTRAP_ALERT = os.environ.get("YOUTUBE_BOOTSTRAP_ALERT", "false").lower() == "true"
@@ -216,13 +221,17 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     seen = set(channel_state.get("seen_ids", []))
     initializing = not seen
     title_filter = config.get("title_contains", "").strip()
+    title_exclude = config.get("title_excludes", "").strip()
     matching = [
         item for item in feed_items
-        if not title_filter or title_filter.casefold() in item["title"].casefold()
+        if (not title_filter or title_filter.casefold() in item["title"].casefold())
+        and (not title_exclude or title_exclude.casefold() not in item["title"].casefold())
     ]
     skipped = [item for item in feed_items if item not in matching]
     if title_filter:
         log(f"{channel_name}: title filter={title_filter!r} | matched={len(matching)} | skipped={len(skipped)}")
+    elif title_exclude:
+        log(f"{channel_name}: title exclusion={title_exclude!r} | matched={len(matching)} | skipped={len(skipped)}")
         # Remember non-matching uploads so they are not reconsidered and
         # reported as skipped on every run. They never trigger an email.
         skipped_new_ids = {item["id"] for item in skipped if item["id"] not in seen}

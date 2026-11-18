@@ -139,6 +139,45 @@ def run_command(args: list[str], timeout: int) -> None:
         raise RuntimeError(f"{args[0]} failed with exit code {result.returncode}: {tail}")
 
 
+def inspect_video(video: dict) -> dict:
+    """Read lightweight yt-dlp metadata before downloading any media."""
+    if not shutil.which("yt-dlp"):
+        raise RuntimeError("yt-dlp is not installed")
+    args = [
+        "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
+        "--no-warnings", video["url"],
+    ]
+    log(f"inspecting metadata: {video['id']}")
+    try:
+        result = subprocess.run(
+            args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=120, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"metadata inspection timed out: {video['id']}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"metadata inspection failed for {video['id']}: {(result.stdout or '')[-1200:]}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"yt-dlp returned invalid metadata for {video['id']}") from exc
+
+
+def video_skip_reason(metadata: dict) -> str | None:
+    """Return a permanent/deferred skip reason, or None if downloadable."""
+    # The /shorts/ URL is the reliable signal available from yt-dlp metadata.
+    urls = [metadata.get("webpage_url", ""), metadata.get("original_url", "")]
+    if any(re.search(r"youtube\.com/shorts/", url, re.IGNORECASE) for url in urls):
+        return "short"
+
+    live_status = str(metadata.get("live_status") or "").casefold()
+    if metadata.get("is_live") is True or live_status in {"is_live", "is_upcoming"}:
+        # Do not add this ID to seen_ids. A later run can process the completed
+        # recording once YouTube reports live_status=was_live/not_live.
+        return "live_or_upcoming"
+    return None
+
+
 def create_audio(video: dict, workdir: Path) -> Path:
     if not shutil.which("yt-dlp"):
         raise RuntimeError("yt-dlp is not installed")
@@ -274,6 +313,21 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     for video in unseen[:MAX_NEW_VIDEOS_PER_RUN]:
         log(f"{channel_name}: processing {video['id']} | {video['title']}")
         try:
+            metadata = inspect_video(video)
+            skip_reason = video_skip_reason(metadata)
+            if skip_reason == "short":
+                seen.add(video["id"])
+                channel_state["skipped_shorts_count"] = channel_state.get("skipped_shorts_count", 0) + 1
+                channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
+                channel_state["status"] = f"skipped Short: {video['id']}"
+                save_state(state)
+                log(f"{channel_name}: skipped Short {video['id']} (recorded permanently)")
+                continue
+            if skip_reason == "live_or_upcoming":
+                channel_state["status"] = f"deferred live/upcoming: {video['id']}"
+                save_state(state)
+                log(f"{channel_name}: deferred live/upcoming {video['id']} (will retry later)")
+                continue
             with tempfile.TemporaryDirectory(prefix="youtube-audio-") as temporary_dir:
                 audio_path = create_audio(video, Path(temporary_dir))
                 audio_bytes = audio_path.stat().st_size

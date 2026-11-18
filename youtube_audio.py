@@ -204,6 +204,16 @@ def video_skip_reason(metadata: dict) -> str | None:
     return None
 
 
+def is_youtube_bot_challenge(error: Exception) -> bool:
+    """Recognize only yt-dlp's explicit YouTube sign-in/bot challenge."""
+    text = str(error).casefold()
+    return (
+        "sign in to confirm" in text
+        and "not a bot" in text
+        and "youtube" in text
+    )
+
+
 def create_audio(video: dict, workdir: Path) -> Path:
     if not shutil.which("yt-dlp"):
         raise RuntimeError("yt-dlp is not installed")
@@ -336,6 +346,7 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
 
     log(f"{channel_name}: queued={len(unseen)}; this run will process up to {MAX_NEW_VIDEOS_PER_RUN}")
     processed = 0
+    deferred = 0
     for video in unseen[:MAX_NEW_VIDEOS_PER_RUN]:
         log(f"{channel_name}: processing {video['id']} | {video['title']}")
         try:
@@ -359,6 +370,16 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
                 audio_bytes = audio_path.stat().st_size
                 send_email(channel_name, video, audio_path)
         except Exception as exc:
+            if is_youtube_bot_challenge(exc):
+                deferred += 1
+                channel_state["status"] = f"deferred YouTube bot challenge: {video['id']}"
+                save_state(state)
+                log(
+                    f"{channel_name}: WARNING deferred {video['id']} because YouTube "
+                    "requested sign-in/bot verification; retry remains enabled; "
+                    "workflow will not be marked failed"
+                )
+                continue
             log(f"{channel_name}: FAILED {video['id']} | retry will remain enabled | {exc}")
             raise RuntimeError(f"{channel_name} video {video['id']} failed: {exc}") from exc
 
@@ -376,7 +397,12 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         log(f"{channel_name}: delivered and checkpointed {video['id']}")
 
     channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
-    channel_state["status"] = f"sent {processed} new audio email(s)"
+    if deferred and processed:
+        channel_state["status"] = f"sent {processed} new audio email(s); deferred {deferred} bot challenge(s)"
+    elif deferred:
+        channel_state["status"] = f"deferred {deferred} bot challenge(s); no workflow error"
+    else:
+        channel_state["status"] = f"sent {processed} new audio email(s)"
 
 
 def main() -> int:

@@ -10,6 +10,7 @@ import email.utils
 import html
 import json
 import os
+import random
 import re
 import shutil
 import smtplib
@@ -63,10 +64,23 @@ MAX_HISTORY = 100
 MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 15 * 60
 USER_AGENT = "Mozilla/5.0 (compatible; PersonalYouTubeAudioMonitor/1.0)"
+CHANNEL_PAUSE_MIN = max(0.0, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MIN", "10")))
+CHANNEL_PAUSE_MAX = max(CHANNEL_PAUSE_MIN, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MAX", "30")))
+METADATA_PAUSE_MIN = max(0.0, float(os.environ.get("YOUTUBE_METADATA_PAUSE_MIN", "3")))
+METADATA_PAUSE_MAX = max(METADATA_PAUSE_MIN, float(os.environ.get("YOUTUBE_METADATA_PAUSE_MAX", "10")))
 
 
 def log(message: str) -> None:
     print(f"[YOUTUBE] {message}", flush=True)
+
+
+def random_pause(label: str, minimum: float, maximum: float) -> None:
+    """Throttle sequential requests without retrying or parallelizing them."""
+    if maximum <= 0:
+        return
+    seconds = random.uniform(minimum, maximum)
+    log(f"pause {seconds:.1f}s before {label}")
+    time.sleep(seconds)
 
 
 def load_state() -> dict:
@@ -139,12 +153,24 @@ def run_command(args: list[str], timeout: int) -> None:
         raise RuntimeError(f"{args[0]} failed with exit code {result.returncode}: {tail}")
 
 
+def yt_dlp_prefix() -> list[str]:
+    """Return optional authentication arguments without logging cookie data."""
+    cookie_file = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    if cookie_file:
+        path = Path(cookie_file)
+        if not path.is_file():
+            raise RuntimeError(f"YOUTUBE_COOKIES_FILE does not exist: {cookie_file}")
+        return ["--cookies", cookie_file]
+    return []
+
+
 def inspect_video(video: dict) -> dict:
     """Read lightweight yt-dlp metadata before downloading any media."""
     if not shutil.which("yt-dlp"):
         raise RuntimeError("yt-dlp is not installed")
+    random_pause(f"metadata inspection {video['id']}", METADATA_PAUSE_MIN, METADATA_PAUSE_MAX)
     args = [
-        "yt-dlp", "--dump-single-json", "--skip-download", "--no-playlist",
+        "yt-dlp", *yt_dlp_prefix(), "--dump-single-json", "--skip-download", "--no-playlist",
         "--no-warnings", video["url"],
     ]
     log(f"inspecting metadata: {video['id']}")
@@ -185,7 +211,7 @@ def create_audio(video: dict, workdir: Path) -> Path:
     source_template = str(workdir / "source.%(ext)s")
     run_command(
         [
-            "yt-dlp",
+            "yt-dlp", *yt_dlp_prefix(),
             "--no-playlist",
             "--no-part",
             "--no-write-info-json",
@@ -362,7 +388,8 @@ def main() -> int:
         f"bootstrap={BOOTSTRAP_ALERT} | max_per_channel={MAX_NEW_VIDEOS_PER_RUN}"
     )
     failures = []
-    for channel_name, config in CHANNELS.items():
+    channel_items = list(CHANNELS.items())
+    for index, (channel_name, config) in enumerate(channel_items):
         if channel_name.casefold() in DISABLED_CHANNELS:
             state["channels"].setdefault(channel_name, {})["status"] = "disabled by YOUTUBE_DISABLED_CHANNELS"
             log(f"{channel_name}: disabled; feed not checked and no email sent")
@@ -373,6 +400,8 @@ def main() -> int:
             failures.append(f"{channel_name}: {type(exc).__name__}: {exc}")
             state["channels"].setdefault(channel_name, {})["status"] = f"ERROR: {type(exc).__name__}: {exc}"
             log(f"{channel_name}: ERROR: {exc}")
+        if index < len(channel_items) - 1:
+            random_pause("next channel check", CHANNEL_PAUSE_MIN, CHANNEL_PAUSE_MAX)
     save_state(state)
     log("run summary:")
     for channel_name in CHANNELS:

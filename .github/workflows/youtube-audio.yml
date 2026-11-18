@@ -26,6 +26,14 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check --no-cache-dir --upgrade yt-dlp
 
+      - name: Prepare optional YouTube cookies
+        if: ${{ secrets.YOUTUBE_COOKIES_B64 != '' }}
+        env:
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+        run: |
+          printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > "$RUNNER_TEMP/youtube-cookies.txt"
+          chmod 600 "$RUNNER_TEMP/youtube-cookies.txt"
+
       - name: Restore YouTube state
         uses: actions/cache/restore@v4
         with:
@@ -48,7 +56,23 @@ jobs:
           YOUTUBE_BOOTSTRAP_ALERT: "false"
           # Process at most three backlog videos in one run.
           YOUTUBE_MAX_NEW_PER_RUN: "3"
-        run: python3 youtube_audio.py
+          # Conservative throttling; these do not replace authentication cookies.
+          YOUTUBE_CHANNEL_PAUSE_MIN: "10"
+          YOUTUBE_CHANNEL_PAUSE_MAX: "30"
+          YOUTUBE_METADATA_PAUSE_MIN: "3"
+          YOUTUBE_METADATA_PAUSE_MAX: "10"
+        run: |
+          if [ -f "$RUNNER_TEMP/youtube-cookies.txt" ]; then
+            export YOUTUBE_COOKIES_FILE="$RUNNER_TEMP/youtube-cookies.txt"
+            echo "YouTube cookie authentication: enabled"
+          else
+            echo "YouTube cookie authentication: not configured"
+          fi
+          python3 youtube_audio.py
+
+      - name: Remove temporary YouTube cookies
+        if: always()
+        run: rm -f "$RUNNER_TEMP/youtube-cookies.txt"
 
       - name: Save YouTube state
         if: always()

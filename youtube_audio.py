@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect new YouTube channel uploads, create tiny MP3s, and email them.
+"""Detect new YouTube channel uploads, download tiny audio files, and email them.
 
 Designed for authorized personal use with public YouTube videos. The feed is
 used for detection; yt-dlp downloads only the specific unseen video.
@@ -44,6 +44,11 @@ DISABLED_CHANNELS = {
     for value in re.split(r"[\n,]", os.environ.get("YOUTUBE_DISABLED_CHANNELS", ""))
     if value.strip()
 }
+RESET_CHANNELS = {
+    value.strip().lstrip("@").casefold()
+    for value in re.split(r"[\n,]", os.environ.get("YOUTUBE_RESET_CHANNELS", ""))
+    if value.strip()
+}
 MAX_HISTORY = 100
 MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 15 * 60
@@ -62,6 +67,7 @@ def load_state() -> dict:
         if not isinstance(state, dict):
             raise ValueError("state is not an object")
         state.setdefault("channels", {})
+        log(f"state loaded: {STATE_PATH} ({len(state['channels'])} channel entries)")
         return state
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError(f"Cannot load {STATE_PATH}: {exc}") from exc
@@ -153,6 +159,7 @@ def create_audio(video: dict, workdir: Path) -> Path:
         raise RuntimeError("yt-dlp produced an empty audio file")
     if output.stat().st_size > MAX_ATTACHMENT_BYTES:
         raise RuntimeError(f"audio is {output.stat().st_size} bytes, above the 24 MB safety limit")
+    log(f"downloaded: {video['id']} | {output.suffix.lstrip('.').upper()} | {output.stat().st_size:,} bytes")
     return output
 
 
@@ -185,9 +192,11 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
     attachment.add_header("Content-Disposition", "attachment", filename=audio_path.name)
     message.attach(attachment)
 
+    log(f"sending email: {channel_name} | {video['id']} | {audio_path.name}")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
         server.login(user, password)
         server.sendmail(user, [recipient], message.as_string())
+    log(f"email accepted: {channel_name} | {video['id']}")
 
 
 def process_channel(state: dict, channel_name: str, config: dict) -> None:
@@ -196,7 +205,14 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         raise RuntimeError("channel RSS feed contained no videos")
 
     channel_state = state["channels"].setdefault(channel_name, {"seen_ids": []})
+    if channel_name.casefold() in RESET_CHANNELS:
+        channel_state["seen_ids"] = []
+        log(f"{channel_name}: one-time reset requested; existing IDs will be re-evaluated")
     seen = set(channel_state.get("seen_ids", []))
+    log(
+        f"{channel_name}: feed={len(feed_items)} | latest={feed_items[0]['id']} "
+        f"| {feed_items[0]['title']} | seen={len(seen)}"
+    )
     if not seen and BOOTSTRAP_ALERT:
         # Explicit test/opt-in mode: process the newest item first.
         unseen = feed_items[:MAX_NEW_VIDEOS_PER_RUN]
@@ -218,19 +234,31 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         log(f"{channel_name}: no new videos")
         return
 
+    log(f"{channel_name}: queued={len(unseen)}; this run will process up to {MAX_NEW_VIDEOS_PER_RUN}")
     processed = 0
     for video in unseen[:MAX_NEW_VIDEOS_PER_RUN]:
-        with tempfile.TemporaryDirectory(prefix="youtube-audio-") as temporary_dir:
-            audio_path = create_audio(video, Path(temporary_dir))
-            audio_bytes = audio_path.stat().st_size
-            send_email(channel_name, video, audio_path)
+        log(f"{channel_name}: processing {video['id']} | {video['title']}")
+        try:
+            with tempfile.TemporaryDirectory(prefix="youtube-audio-") as temporary_dir:
+                audio_path = create_audio(video, Path(temporary_dir))
+                audio_bytes = audio_path.stat().st_size
+                send_email(channel_name, video, audio_path)
+        except Exception as exc:
+            log(f"{channel_name}: FAILED {video['id']} | retry will remain enabled | {exc}")
+            raise RuntimeError(f"{channel_name} video {video['id']} failed: {exc}") from exc
+
+        # Checkpoint after every successful delivery. If a later video fails,
+        # earlier successful emails are not sent again on the next run.
         seen.add(video["id"])
         processed += 1
+        channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
         channel_state["latest_id"] = video["id"]
         channel_state["latest_title"] = video["title"]
         channel_state["latest_url"] = video["url"]
         channel_state["latest_bytes"] = audio_bytes
-        log(f"{channel_name}: email sent for {video['title']}")
+        channel_state["status"] = f"delivered {processed} video(s) this run"
+        save_state(state)
+        log(f"{channel_name}: delivered and checkpointed {video['id']}")
 
     channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
     channel_state["status"] = f"sent {processed} new audio email(s)"
@@ -238,6 +266,12 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
 
 def main() -> int:
     state = load_state()
+    log(
+        f"run started: channels={','.join(CHANNELS)} | "
+        f"disabled={','.join(sorted(DISABLED_CHANNELS)) or 'none'} | "
+        f"reset={','.join(sorted(RESET_CHANNELS)) or 'none'} | "
+        f"bootstrap={BOOTSTRAP_ALERT} | max_per_channel={MAX_NEW_VIDEOS_PER_RUN}"
+    )
     failures = []
     for channel_name, config in CHANNELS.items():
         if channel_name.casefold() in DISABLED_CHANNELS:
@@ -251,6 +285,10 @@ def main() -> int:
             state["channels"].setdefault(channel_name, {})["status"] = f"ERROR: {type(exc).__name__}: {exc}"
             log(f"{channel_name}: ERROR: {exc}")
     save_state(state)
+    log("run summary:")
+    for channel_name in CHANNELS:
+        channel_state = state["channels"].get(channel_name, {})
+        log(f"  {channel_name}: {channel_state.get('status', 'not processed')}")
     if failures:
         return 1
     return 0

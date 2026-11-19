@@ -86,10 +86,10 @@ jobs:
           # Process at most three backlog videos in one run.
           YOUTUBE_MAX_NEW_PER_RUN: "3"
           # Conservative throttling; these do not replace authentication cookies.
-          YOUTUBE_CHANNEL_PAUSE_MIN: "10"
-          YOUTUBE_CHANNEL_PAUSE_MAX: "30"
-          YOUTUBE_METADATA_PAUSE_MIN: "3"
-          YOUTUBE_METADATA_PAUSE_MAX: "10"
+          YOUTUBE_CHANNEL_PAUSE_MIN: "3"
+          YOUTUBE_CHANNEL_PAUSE_MAX: "8"
+          YOUTUBE_METADATA_PAUSE_MIN: "1"
+          YOUTUBE_METADATA_PAUSE_MAX: "3"
         run: |
           if [ -f "$RUNNER_TEMP/youtube-cookies.txt" ]; then
             export YOUTUBE_COOKIES_FILE="$RUNNER_TEMP/youtube-cookies.txt"

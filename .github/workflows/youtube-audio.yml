@@ -30,6 +30,11 @@ jobs:
           deno-version: v2.3.0
           cache: true
 
+      - name: Install FFmpeg for compact MP3 attachments
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
       - name: Install yt-dlp
         run: |
           python3 -m pip install --disable-pip-version-check --no-cache-dir --upgrade "yt-dlp[default]"

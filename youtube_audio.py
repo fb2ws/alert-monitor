@@ -176,7 +176,8 @@ def inspect_video(video: dict) -> dict:
     random_pause(f"metadata inspection {video['id']}", METADATA_PAUSE_MIN, METADATA_PAUSE_MAX)
     args = [
         "yt-dlp", "--ignore-config", *yt_dlp_prefix(),
-        "--dump-single-json", "--skip-download", "--no-playlist",
+        "--dump-single-json", "--skip-download", "--ignore-no-formats-error",
+        "--no-playlist",
         "--no-warnings", video["url"],
     ]
     log(f"inspecting metadata: {video['id']}")

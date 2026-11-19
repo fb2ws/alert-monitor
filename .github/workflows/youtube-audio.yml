@@ -16,15 +16,24 @@ concurrency:
 jobs:
   download-and-email:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # A 15-minute trigger may arrive while a backlog is still processing.
+    # Never cancel the active run; let it checkpoint and finish.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Deno JavaScript runtime for YouTube challenge solving
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.3.0
+          cache: true
+
       - name: Install yt-dlp
         run: |
-          python3 -m pip install --disable-pip-version-check --no-cache-dir --upgrade yt-dlp
+          python3 -m pip install --disable-pip-version-check --no-cache-dir --upgrade "yt-dlp[default]"
+          python3 -c "import yt_dlp; print('yt-dlp', yt_dlp.version.__version__)"
           yt-dlp --version
 
       - name: Prepare YouTube cookies

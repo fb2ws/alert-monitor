@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -158,6 +159,11 @@ def fetch_feed(channel_id: str) -> list[dict]:
 def safe_filename(name: str) -> str:
     name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name).strip(" .")
     return (name[:120] or "youtube-audio")
+
+
+def normalized_match_text(value: str) -> str:
+    """Normalize compatibility characters before applying title filters."""
+    return unicodedata.normalize("NFKC", value).casefold()
 
 
 def run_command(args: list[str], timeout: int) -> None:
@@ -351,10 +357,12 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     if isinstance(configured_excludes, str):
         configured_excludes = [configured_excludes]
     title_excludes = [term.strip() for term in configured_excludes if term.strip()]
+    normalized_filter = normalized_match_text(title_filter)
+    normalized_excludes = [normalized_match_text(term) for term in title_excludes]
     matching = [
         item for item in feed_items
-        if (not title_filter or title_filter.casefold() in item["title"].casefold())
-        and all(term.casefold() not in item["title"].casefold() for term in title_excludes)
+        if (not normalized_filter or normalized_filter in normalized_match_text(item["title"]))
+        and all(term not in normalized_match_text(item["title"]) for term in normalized_excludes)
     ]
     skipped = [item for item in feed_items if item not in matching]
     if title_filter:
@@ -387,12 +395,13 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     )
     if not seen and BOOTSTRAP_ALERT:
         # Explicit test/opt-in mode: process the newest item first.
-        unseen = feed_items[:MAX_NEW_VIDEOS_PER_RUN]
+        unseen = [item for item in matching if item["id"] not in seen][:MAX_NEW_VIDEOS_PER_RUN]
     else:
         # Normal mode processes a backlog oldest-first so delivery order is
         # chronological when more than one upload is waiting.
         unseen = [item for item in reversed(matching) if item["id"] not in seen]
 
+    log(f"{channel_name}: matching={len(matching)} | unseen_matching={len(unseen)}")
     if not unseen:
         channel_state["status"] = "no new videos"
         log(f"{channel_name}: no new videos")

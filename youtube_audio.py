@@ -214,10 +214,14 @@ def video_skip_reason(metadata: dict) -> str | None:
         return "short"
 
     live_status = str(metadata.get("live_status") or "").casefold()
-    if metadata.get("is_live") is True or live_status in {"is_live", "is_upcoming"}:
+    if live_status == "is_upcoming":
+        # Do not add this ID to seen_ids. A later run can process it after the
+        # premiere has finished and YouTube reports a completed recording.
+        return "premiere"
+    if metadata.get("is_live") is True or live_status == "is_live":
         # Do not add this ID to seen_ids. A later run can process the completed
         # recording once YouTube reports live_status=was_live/not_live.
-        return "live_or_upcoming"
+        return "live"
     return None
 
 
@@ -294,7 +298,7 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
         raise RuntimeError("EMAIL_USER, EMAIL_PASS, and RECEIVER_EMAILS are required for YouTube alerts")
 
     message = MIMEMultipart()
-    message["Subject"] = video["title"]
+    message["Subject"] = f"{channel_name}: {video['title']}"
     message["From"] = user
     message["To"] = ", ".join(recipients)
     message["X-Alert-Monitor"] = "youtube-audio"
@@ -388,6 +392,8 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     log(f"{channel_name}: queued={len(unseen)}; this run will process up to {MAX_NEW_VIDEOS_PER_RUN}")
     processed = 0
     deferred = 0
+    deferred_premieres = 0
+    deferred_live = 0
     for video in unseen[:MAX_NEW_VIDEOS_PER_RUN]:
         log(f"{channel_name}: processing {video['id']} | {video['title']}")
         try:
@@ -401,10 +407,14 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
                 save_state(state)
                 log(f"{channel_name}: skipped Short {video['id']} (recorded permanently)")
                 continue
-            if skip_reason == "live_or_upcoming":
-                channel_state["status"] = f"deferred live/upcoming: {video['id']}"
+            if skip_reason in {"premiere", "live"}:
+                if skip_reason == "premiere":
+                    deferred_premieres += 1
+                else:
+                    deferred_live += 1
+                channel_state["status"] = f"deferred {skip_reason}: {video['id']}"
                 save_state(state)
-                log(f"{channel_name}: deferred live/upcoming {video['id']} (will retry later)")
+                log(f"{channel_name}: deferred {skip_reason} {video['id']} (will retry later)")
                 continue
             with tempfile.TemporaryDirectory(prefix="youtube-audio-") as temporary_dir:
                 audio_path = create_audio(video, Path(temporary_dir))
@@ -439,10 +449,16 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         log(f"{channel_name}: delivered and checkpointed {video['id']}")
 
     channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
-    if deferred and processed:
-        channel_state["status"] = f"sent {processed} new audio email(s); deferred {deferred} bot challenge(s)"
-    elif deferred:
-        channel_state["status"] = f"deferred {deferred} bot challenge(s); no workflow error"
+    deferred_parts = []
+    if deferred_premieres:
+        deferred_parts.append(f"deferred {deferred_premieres} premiere(s)")
+    if deferred_live:
+        deferred_parts.append(f"deferred {deferred_live} live video(s)")
+    if deferred:
+        deferred_parts.append(f"deferred {deferred} temporary access issue(s)")
+    if deferred_parts:
+        delivery = f"sent {processed} new audio email(s)" if processed else "no email sent"
+        channel_state["status"] = f"{delivery}; {'; '.join(deferred_parts)}"
     else:
         channel_state["status"] = f"sent {processed} new audio email(s)"
 

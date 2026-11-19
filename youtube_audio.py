@@ -226,6 +226,8 @@ def is_youtube_temporary_error(error: Exception) -> bool:
 def create_audio(video: dict, workdir: Path) -> Path:
     if not shutil.which("yt-dlp"):
         raise RuntimeError("yt-dlp is not installed")
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg is not installed")
 
     source_template = str(workdir / "source.%(ext)s")
     run_command(
@@ -248,12 +250,27 @@ def create_audio(video: dict, workdir: Path) -> Path:
     if len(sources) != 1:
         raise RuntimeError(f"expected one downloaded source, found {len(sources)}")
 
-    output = sources[0]
-    if output.stat().st_size == 0:
+    source = sources[0]
+    if source.stat().st_size == 0:
         raise RuntimeError("yt-dlp produced an empty audio file")
+    log(f"downloaded source: {video['id']} | {source.suffix.lstrip('.').upper()} | {source.stat().st_size:,} bytes")
+
+    output = workdir / f"{safe_filename(video['title'])}.mp3"
+    # Convert to a small, broadly compatible speech-oriented MP3 so Gmail's
+    # encoded attachment remains well below its 25 MB message limit.
+    run_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source), "-vn", "-ac", "1", "-ar", "22050",
+            "-codec:a", "libmp3lame", "-b:a", "32k", str(output),
+        ],
+        10 * 60,
+    )
+    if not output.exists() or output.stat().st_size == 0:
+        raise RuntimeError("FFmpeg produced no audio file")
     if output.stat().st_size > MAX_ATTACHMENT_BYTES:
-        raise RuntimeError(f"audio is {output.stat().st_size} bytes, above the 24 MB safety limit")
-    log(f"downloaded: {video['id']} | {output.suffix.lstrip('.').upper()} | {output.stat().st_size:,} bytes")
+        raise RuntimeError(f"converted audio is {output.stat().st_size} bytes, above the 24 MB safety limit")
+    log(f"converted: {video['id']} | MP3 mono 32k | {output.stat().st_size:,} bytes")
     return output
 
 
@@ -265,7 +282,7 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
         raise RuntimeError("EMAIL_USER, EMAIL_PASS, and RECEIVER_EMAIL are required")
 
     message = MIMEMultipart()
-    message["Subject"] = f"YouTube Audio: {video['title']}"
+    message["Subject"] = video["title"]
     message["From"] = user
     message["To"] = recipient
     message["X-Alert-Monitor"] = "youtube-audio"
@@ -276,12 +293,12 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
         f"Video: {video['url']}\n"
         f"Video ID: {video['id']}\n"
         f"Published: {published}\n\n"
-        "The lowest-quality audio-only file is attached.\n"
-        f"Format: {audio_path.suffix.lstrip('.').upper()}\n"
+        "A small speech-oriented audio file is attached.\n"
+        "Format: MP3, mono, 32 kbps\n"
     )
     message.attach(MIMEText(body, "plain", "utf-8"))
     with audio_path.open("rb") as audio_file:
-        subtype = {".m4a": "mp4", ".webm": "webm"}.get(audio_path.suffix.lower(), "octet-stream")
+        subtype = "mpeg" if audio_path.suffix.lower() == ".mp3" else "octet-stream"
         attachment = MIMEApplication(audio_file.read(), _subtype=subtype)
     attachment.add_header("Content-Disposition", "attachment", filename=audio_path.name)
     message.attach(attachment)

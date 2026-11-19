@@ -75,6 +75,9 @@ jobs:
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          # Comma-, semicolon-, or newline-separated recipients.
+          RECEIVER_EMAILS: ${{ secrets.RECEIVER_EMAILS }}
+          # Backward-compatible single-recipient fallback.
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           # Repository variable. Example: HKLocalTV,AnotherChannel
           YOUTUBE_DISABLED_CHANNELS: ${{ vars.YOUTUBE_DISABLED_CHANNELS }}

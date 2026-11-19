@@ -175,7 +175,7 @@ def inspect_video(video: dict) -> dict:
         raise RuntimeError("yt-dlp is not installed")
     random_pause(f"metadata inspection {video['id']}", METADATA_PAUSE_MIN, METADATA_PAUSE_MAX)
     args = [
-        "yt-dlp", "--ignore-config", *yt_dlp_prefix(),
+        "yt-dlp", "--ignore-config", "--js-runtimes", "deno", *yt_dlp_prefix(),
         "--dump-single-json", "--skip-download", "--ignore-no-formats-error",
         "--no-playlist",
         "--no-warnings", video["url"],
@@ -230,7 +230,7 @@ def create_audio(video: dict, workdir: Path) -> Path:
     source_template = str(workdir / "source.%(ext)s")
     run_command(
         [
-            "yt-dlp", "--ignore-config", *yt_dlp_prefix(),
+            "yt-dlp", "--ignore-config", "--js-runtimes", "deno", *yt_dlp_prefix(),
             "--no-playlist",
             "--no-part",
             "--no-write-info-json",

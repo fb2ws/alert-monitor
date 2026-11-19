@@ -204,16 +204,16 @@ def video_skip_reason(metadata: dict) -> str | None:
     return None
 
 
-def is_youtube_bot_challenge(error: Exception) -> bool:
+def is_youtube_temporary_error(error: Exception) -> bool:
     """Recognize temporary YouTube access/status errors that should be retried."""
-    text = str(error).casefold()
+    text = str(error).casefold().replace("’", "'")
     bot_challenge = (
         "sign in to confirm" in text
         and "not a bot" in text
-        and "youtube" in text
     )
     scheduled_premiere = "premieres in" in text or "premiere in" in text
-    return bot_challenge or scheduled_premiere
+    no_player_response = "failed to extract any player response" in text
+    return bot_challenge or scheduled_premiere or no_player_response
 
 
 def create_audio(video: dict, workdir: Path) -> Path:
@@ -372,13 +372,13 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
                 audio_bytes = audio_path.stat().st_size
                 send_email(channel_name, video, audio_path)
         except Exception as exc:
-            if is_youtube_bot_challenge(exc):
+            if is_youtube_temporary_error(exc):
                 deferred += 1
                 channel_state["status"] = f"deferred YouTube bot challenge: {video['id']}"
                 save_state(state)
                 log(
                     f"{channel_name}: WARNING deferred {video['id']} because YouTube "
-                    "returned a temporary bot challenge or scheduled premiere status; "
+                    "returned a temporary access or player-extraction status; "
                     "retry remains enabled; "
                     "workflow will not be marked failed"
                 )

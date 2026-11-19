@@ -57,6 +57,14 @@ CHANNELS = {
         "title_contains": "大君伐",
     },
 }
+CHANNEL_SUBJECT_PREFIXES = {
+    "HKLocalTV": "神駒",
+    "Qiage": "港燦",
+    "memeHongKong": "燈神",
+    "WhirlingCloudsValley": "陶傑",
+    "LionInvestment": "Liongor",
+    "hkpeanutscom": "花生台",
+}
 STATE_PATH = Path(os.environ.get("YOUTUBE_STATE_FILE", "youtube_state.json"))
 BOOTSTRAP_ALERT = os.environ.get("YOUTUBE_BOOTSTRAP_ALERT", "false").lower() == "true"
 MAX_NEW_VIDEOS_PER_RUN = int(os.environ.get("YOUTUBE_MAX_NEW_PER_RUN", "3"))
@@ -298,7 +306,8 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
         raise RuntimeError("EMAIL_USER, EMAIL_PASS, and RECEIVER_EMAILS are required for YouTube alerts")
 
     message = MIMEMultipart()
-    message["Subject"] = f"{channel_name}: {video['title']}"
+    subject_prefix = CHANNEL_SUBJECT_PREFIXES.get(channel_name, channel_name)
+    message["Subject"] = f"{subject_prefix}: {video['title']}"
     message["From"] = user
     message["To"] = ", ".join(recipients)
     message["X-Alert-Monitor"] = "youtube-audio"

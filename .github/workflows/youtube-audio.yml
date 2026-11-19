@@ -26,17 +26,26 @@ jobs:
         run: |
           python3 -m pip install --disable-pip-version-check --no-cache-dir --upgrade yt-dlp
 
-      - name: Prepare optional YouTube cookies
+      - name: Prepare YouTube cookies
         env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
           YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
         run: |
-          if [ -n "$YOUTUBE_COOKIES_B64" ]; then
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            printf '%s\n' "$YOUTUBE_COOKIES" > "$RUNNER_TEMP/youtube-cookies.txt"
+          elif [ -n "$YOUTUBE_COOKIES_B64" ]; then
             printf '%s' "$YOUTUBE_COOKIES_B64" | base64 --decode > "$RUNNER_TEMP/youtube-cookies.txt"
-            chmod 600 "$RUNNER_TEMP/youtube-cookies.txt"
-            echo "YouTube cookie file prepared in the temporary runner."
           else
-            echo "No YouTube cookie secret configured; continuing without cookies."
+            echo "::error::YOUTUBE_COOKIES is missing. Add it under Settings > Secrets and variables > Actions > Secrets."
+            exit 1
           fi
+          chmod 600 "$RUNNER_TEMP/youtube-cookies.txt"
+          if ! grep -qE '^# (Netscape )?HTTP Cookie File' "$RUNNER_TEMP/youtube-cookies.txt"; then
+            echo "::error::The cookie secret is not Netscape/Mozilla cookie-file format. Re-export it with yt-dlp --cookies-from-browser ... --cookies youtube-cookies.txt."
+            rm -f "$RUNNER_TEMP/youtube-cookies.txt"
+            exit 1
+          fi
+          echo "YouTube cookie file prepared and format validated."
 
       - name: Restore YouTube state
         uses: actions/cache/restore@v4
@@ -70,7 +79,8 @@ jobs:
             export YOUTUBE_COOKIES_FILE="$RUNNER_TEMP/youtube-cookies.txt"
             echo "YouTube cookie authentication: enabled"
           else
-            echo "YouTube cookie authentication: not configured"
+            echo "::error::Temporary cookie file is missing after preparation."
+            exit 1
           fi
           python3 youtube_audio.py
 

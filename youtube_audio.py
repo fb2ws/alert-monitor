@@ -46,6 +46,16 @@ CHANNELS = {
         "url": "https://www.youtube.com/@WhirlingCloudsValley/videos",
         "title_excludes": "合集",
     },
+    "LionInvestment": {
+        "id": "UCgyTp-zlMz6D-6BSB9yB62A",
+        "url": "https://www.youtube.com/@Lion哥的投資世界/videos",
+        "title_excludes": ["中文字幕", "有片", "廣東話"],
+    },
+    "hkpeanutscom": {
+        "id": "UCsaaqRi_Y0a1-MmdHG7FypQ",
+        "url": "https://www.youtube.com/@hkpeanutscom/streams",
+        "title_contains": "大君伐",
+    },
 }
 STATE_PATH = Path(os.environ.get("YOUTUBE_STATE_FILE", "youtube_state.json"))
 BOOTSTRAP_ALERT = os.environ.get("YOUTUBE_BOOTSTRAP_ALERT", "false").lower() == "true"
@@ -238,9 +248,10 @@ def create_audio(video: dict, workdir: Path) -> Path:
             "--no-write-info-json",
             "--no-write-thumbnail",
             "--restrict-filenames",
-            # Keep the already-compressed YouTube audio stream. Prefer M4A for
-            # compatibility, then WebM. This avoids a full FFmpeg install.
+            # Prefer a small audio-only source; SponsorBlock removes marked
+            # segments before the later MP3 conversion and email step.
             "--format", "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio",
+            "--sponsorblock-remove", "all",
             "--output", source_template,
             video["url"],
         ],
@@ -277,14 +288,15 @@ def create_audio(video: dict, workdir: Path) -> Path:
 def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
     user = os.environ.get("EMAIL_USER")
     password = os.environ.get("EMAIL_PASS")
-    recipient = os.environ.get("RECEIVER_EMAIL")
-    if not all([user, password, recipient]):
-        raise RuntimeError("EMAIL_USER, EMAIL_PASS, and RECEIVER_EMAIL are required")
+    raw_recipients = os.environ.get("RECEIVER_EMAILS") or os.environ.get("RECEIVER_EMAIL", "")
+    recipients = [value.strip() for value in re.split(r"[,;\n]+", raw_recipients) if value.strip()]
+    if not user or not password or not recipients:
+        raise RuntimeError("EMAIL_USER, EMAIL_PASS, and RECEIVER_EMAILS are required")
 
     message = MIMEMultipart()
     message["Subject"] = video["title"]
     message["From"] = user
-    message["To"] = recipient
+    message["To"] = ", ".join(recipients)
     message["X-Alert-Monitor"] = "youtube-audio"
 
     published = video.get("published") or "Unknown"
@@ -306,7 +318,7 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
     log(f"sending email: {channel_name} | {video['id']} | {audio_path.name}")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
         server.login(user, password)
-        server.sendmail(user, [recipient], message.as_string())
+        server.sendmail(user, recipients, message.as_string())
     log(f"email accepted: {channel_name} | {video['id']}")
 
 
@@ -322,17 +334,20 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     seen = set(channel_state.get("seen_ids", []))
     initializing = not seen
     title_filter = config.get("title_contains", "").strip()
-    title_exclude = config.get("title_excludes", "").strip()
+    configured_excludes = config.get("title_excludes", [])
+    if isinstance(configured_excludes, str):
+        configured_excludes = [configured_excludes]
+    title_excludes = [term.strip() for term in configured_excludes if term.strip()]
     matching = [
         item for item in feed_items
         if (not title_filter or title_filter.casefold() in item["title"].casefold())
-        and (not title_exclude or title_exclude.casefold() not in item["title"].casefold())
+        and all(term.casefold() not in item["title"].casefold() for term in title_excludes)
     ]
     skipped = [item for item in feed_items if item not in matching]
     if title_filter:
         log(f"{channel_name}: title filter={title_filter!r} | matched={len(matching)} | skipped={len(skipped)}")
-    elif title_exclude:
-        log(f"{channel_name}: title exclusion={title_exclude!r} | matched={len(matching)} | skipped={len(skipped)}")
+    elif title_excludes:
+        log(f"{channel_name}: title exclusions={title_excludes!r} | matched={len(matching)} | skipped={len(skipped)}")
         # Remember non-matching uploads so they are not reconsidered and
         # reported as skipped on every run. They never trigger an email.
         skipped_new_ids = {item["id"] for item in skipped if item["id"] not in seen}

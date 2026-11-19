@@ -288,10 +288,10 @@ def create_audio(video: dict, workdir: Path) -> Path:
 def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
     user = os.environ.get("EMAIL_USER")
     password = os.environ.get("EMAIL_PASS")
-    raw_recipients = os.environ.get("RECEIVER_EMAILS") or os.environ.get("RECEIVER_EMAIL", "")
+    raw_recipients = os.environ.get("RECEIVER_EMAILS", "")
     recipients = [value.strip() for value in re.split(r"[,;\n]+", raw_recipients) if value.strip()]
     if not user or not password or not recipients:
-        raise RuntimeError("EMAIL_USER, EMAIL_PASS, and RECEIVER_EMAILS are required")
+        raise RuntimeError("EMAIL_USER, EMAIL_PASS, and RECEIVER_EMAILS are required for YouTube alerts")
 
     message = MIMEMultipart()
     message["Subject"] = video["title"]

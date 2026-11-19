@@ -160,6 +160,11 @@ def yt_dlp_prefix() -> list[str]:
         path = Path(cookie_file)
         if not path.is_file():
             raise RuntimeError(f"YOUTUBE_COOKIES_FILE does not exist: {cookie_file}")
+        if path.stat().st_size == 0:
+            raise RuntimeError("YOUTUBE_COOKIES_FILE is empty")
+        first_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if not any(line.startswith("# Netscape HTTP Cookie File") or line.startswith("# HTTP Cookie File") for line in first_lines[:3]):
+            raise RuntimeError("YOUTUBE_COOKIES_FILE is not Netscape/Mozilla cookie-file format")
         return ["--cookies", cookie_file]
     return []
 

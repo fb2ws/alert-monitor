@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-import unicodedata
+from datetime import datetime, timedelta, timezone
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -83,6 +83,10 @@ MAX_HISTORY = 100
 MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 15 * 60
 USER_AGENT = "Mozilla/5.0 (compatible; PersonalYouTubeAudioMonitor/1.0)"
+# Delay only memeHongKong so SponsorBlock has time to receive community
+# submissions. Change this value in the code while tuning the best trade-off.
+MEMEHONGKONG_DELAY_HOURS = 1.0
+HONG_KONG_TIMEZONE = timezone(timedelta(hours=8), name="HKT")
 CHANNEL_PAUSE_MIN = max(0.0, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MIN", "10")))
 CHANNEL_PAUSE_MAX = max(CHANNEL_PAUSE_MIN, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MAX", "30")))
 METADATA_PAUSE_MIN = max(0.0, float(os.environ.get("YOUTUBE_METADATA_PAUSE_MIN", "3")))
@@ -161,9 +165,34 @@ def safe_filename(name: str) -> str:
     return (name[:120] or "youtube-audio")
 
 
-def normalized_match_text(value: str) -> str:
-    """Normalize compatibility characters before applying title filters."""
-    return unicodedata.normalize("NFKC", value).casefold()
+def published_datetime(video: dict) -> datetime | None:
+    """Parse a YouTube Atom publication timestamp as an aware UTC datetime."""
+    value = str(video.get("published") or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def hong_kong_published_text(video: dict) -> str:
+    published = published_datetime(video)
+    if published is None:
+        return str(video.get("published") or "Unknown")
+    return published.astimezone(HONG_KONG_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S HKT")
+
+
+def is_delayed_for_sponsorblock(channel_name: str, video: dict) -> bool:
+    """Return whether a new memeHongKong video is still inside the delay window."""
+    if channel_name != "memeHongKong" or MEMEHONGKONG_DELAY_HOURS <= 0:
+        return False
+    published = published_datetime(video)
+    if published is None:
+        log(f"{channel_name}: cannot parse publication time for {video['id']}; processing without delay")
+        return False
+    age = datetime.now(timezone.utc) - published
+    return age < timedelta(hours=MEMEHONGKONG_DELAY_HOURS)
 
 
 def run_command(args: list[str], timeout: int) -> None:
@@ -318,11 +347,9 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
     message["To"] = ", ".join(recipients)
     message["X-Alert-Monitor"] = "youtube-audio"
 
-    published = video.get("published") or "Unknown"
+    published = hong_kong_published_text(video)
     body = (
-        f"Channel: {channel_name}\n"
         f"Video: {video['url']}\n"
-        f"Video ID: {video['id']}\n"
         f"Published: {published}\n\n"
         "A small speech-oriented audio file is attached.\n"
         "Format: MP3, mono, 32 kbps\n"
@@ -337,7 +364,10 @@ def send_email(channel_name: str, video: dict, audio_path: Path) -> None:
     log(f"sending email: {channel_name} | {video['id']} | {audio_path.name}")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
         server.login(user, password)
-        server.sendmail(user, recipients, message.as_string())
+        refused = server.sendmail(user, recipients, message.as_string())
+    if refused:
+        refused_addresses = ", ".join(sorted(refused))
+        raise RuntimeError(f"Gmail refused recipient(s): {refused_addresses}")
     log(f"email accepted: {channel_name} | {video['id']}")
 
 
@@ -357,12 +387,10 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
     if isinstance(configured_excludes, str):
         configured_excludes = [configured_excludes]
     title_excludes = [term.strip() for term in configured_excludes if term.strip()]
-    normalized_filter = normalized_match_text(title_filter)
-    normalized_excludes = [normalized_match_text(term) for term in title_excludes]
     matching = [
         item for item in feed_items
-        if (not normalized_filter or normalized_filter in normalized_match_text(item["title"]))
-        and all(term not in normalized_match_text(item["title"]) for term in normalized_excludes)
+        if (not title_filter or title_filter.casefold() in item["title"].casefold())
+        and all(term.casefold() not in item["title"].casefold() for term in title_excludes)
     ]
     skipped = [item for item in feed_items if item not in matching]
     if title_filter:
@@ -400,6 +428,16 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         # Normal mode processes a backlog oldest-first so delivery order is
         # chronological when more than one upload is waiting.
         unseen = [item for item in reversed(matching) if item["id"] not in seen]
+
+    if unseen and channel_name == "memeHongKong":
+        eligible = [item for item in unseen if not is_delayed_for_sponsorblock(channel_name, item)]
+        delayed_count = len(unseen) - len(eligible)
+        if delayed_count:
+            log(
+                f"{channel_name}: deferred {delayed_count} video(s) for SponsorBlock; "
+                f"delay={MEMEHONGKONG_DELAY_HOURS:g} hour(s)"
+            )
+        unseen = eligible
 
     log(f"{channel_name}: matching={len(matching)} | unseen_matching={len(unseen)}")
     if not unseen:

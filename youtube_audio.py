@@ -162,7 +162,14 @@ def fetch_feed(channel_id: str) -> list[dict]:
 
 def safe_filename(name: str) -> str:
     name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name).strip(" .")
-    return (name[:120] or "youtube-audio")
+    if not name:
+        return "youtube-audio"
+    # Linux limits a single filename to 255 UTF-8 bytes, not 255 characters.
+    # Chinese characters commonly use three bytes, so character-only slicing
+    # can still produce an invalidly long filename for FFmpeg.
+    safe_bytes = name.encode("utf-8")[:120]
+    name = safe_bytes.decode("utf-8", errors="ignore").rstrip(" .")
+    return name or "youtube-audio"
 
 
 def published_datetime(video: dict) -> datetime | None:

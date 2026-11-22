@@ -85,7 +85,7 @@ DOWNLOAD_TIMEOUT_SECONDS = 15 * 60
 USER_AGENT = "Mozilla/5.0 (compatible; PersonalYouTubeAudioMonitor/1.0)"
 # Delay only memeHongKong so SponsorBlock has time to receive community
 # submissions. Change this value in the code while tuning the best trade-off.
-MEMEHONGKONG_DELAY_HOURS = 1.8
+MEMEHONGKONG_DELAY_HOURS = 2
 HONG_KONG_TIMEZONE = timezone(timedelta(hours=8), name="HKT")
 CHANNEL_PAUSE_MIN = max(0.0, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MIN", "10")))
 CHANNEL_PAUSE_MAX = max(CHANNEL_PAUSE_MIN, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MAX", "30")))

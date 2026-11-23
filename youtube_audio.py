@@ -296,6 +296,7 @@ def is_youtube_retryable_unavailable_error(error: Exception) -> bool:
         or "too many requests" in text
         or "video unavailable" in text
         or "this content isn't available" in text
+        or "requested format is not available" in text
     )
 
 
@@ -314,9 +315,11 @@ def create_audio(video: dict, workdir: Path) -> Path:
             "--no-write-info-json",
             "--no-write-thumbnail",
             "--restrict-filenames",
-            # Prefer a small audio-only source; SponsorBlock removes marked
-            # segments before the later MP3 conversion and email step.
-            "--format", "worstaudio[ext=m4a]/worstaudio[ext=webm]/worstaudio",
+            # Select any available audio source. The later FFmpeg step always
+            # converts it to mono 32 kbps MP3, so a strict worst-audio format
+            # selector provides no benefit and can fail when YouTube exposes
+            # only a restricted client-specific format set.
+            "--format", "bestaudio/best",
             "--sponsorblock-remove", "all",
             "--output", source_template,
             video["url"],

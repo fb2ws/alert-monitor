@@ -71,6 +71,22 @@ def load_facebook_pages():
     return pages
 
 
+def load_facebook_skip_terms(page_url):
+    """Read comma/newline-separated skip terms for one Facebook page.
+
+    For https://www.facebook.com/aillynotes, the corresponding repository
+    variable is FB_SKIP_TERMS_AILLYNOTES.
+    """
+    page_key = re.sub(r"[^A-Za-z0-9]+", "_", page_url.rstrip("/").rsplit("/", 1)[-1]).strip("_").upper()
+    raw_value = os.environ.get(f"FB_SKIP_TERMS_{page_key}", "")
+    try:
+        decoded = json.loads(raw_value)
+        raw_terms = decoded if isinstance(decoded, list) else re.split(r"[\n,]", raw_value)
+    except json.JSONDecodeError:
+        raw_terms = re.split(r"[\n,]", raw_value)
+    return [str(term).strip() for term in raw_terms if str(term).strip()]
+
+
 FB_PAGES = load_facebook_pages()
 
 OWNDAYS_URL = "https://www.owndays.com/jp/en/products/SENICHI31?sku=6259"
@@ -659,6 +675,34 @@ def check_facebook(page, url, state):
                 state,
                 "FACEBOOK",
                 f"No clean latest-post text found for {base_url}; selector counts: {extraction_diagnostics}",
+            )
+            return state
+
+        skip_terms = load_facebook_skip_terms(base_url)
+        monitor["skip_terms"] = skip_terms
+        matched_skip_terms = [
+            term for term in skip_terms if term.casefold() in final_text.casefold()
+        ]
+        if matched_skip_terms:
+            # Record the skipped post as seen so the same unwanted post is not
+            # reconsidered and logged on every subsequent workflow run.
+            skipped_fingerprint = facebook_candidate_fingerprint(final_text)
+            monitor["last_post_text"] = final_text
+            monitor["candidate_history"].append(
+                {
+                    "observed_at": get_hk_time(),
+                    "fingerprint": skipped_fingerprint,
+                    "candidate": shorten(final_text, 300),
+                    "alerted": True,
+                    "comparison_reason": "skipped by configured term",
+                }
+            )
+            monitor["candidate_history"] = monitor["candidate_history"][-20:]
+            monitor["status"] = f"SKIPPED: matched Facebook term(s): {matched_skip_terms}"
+            log_event(
+                state,
+                "FACEBOOK",
+                f"Skipped alert for {base_url}; matched configured term(s): {matched_skip_terms}",
             )
             return state
 

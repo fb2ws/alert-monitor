@@ -33,6 +33,10 @@ EPRICE_BOOTSTRAP_ALERT = os.environ.get("EPRICE_BOOTSTRAP_ALERT", "false").lower
 EPRICE_MAX_SAVED_GUIDS = 100
 EPRICE_HTTP_TIMEOUT = 30
 
+HKTVMALL_PRODUCT_URL = "https://www.hktvmall.com/hktv/zh/main/%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E5%AE%98%E6%96%B9%E6%97%97%E8%89%A6%E5%BA%97/s/H1108001/%E8%B6%85%E7%B4%9A%E5%B7%BF%E5%A0%B4/%E8%B6%85%E7%B4%9A%E5%B8%82%E5%A0%B4/%E9%A3%B2%E5%93%81-%E5%8D%B3%E6%B2%96%E9%A3%B2%E5%93%81/%E6%B1%BD%E6%B0%B4/%E5%8E%9F%E7%AE%B1-%E7%BD%90%E8%A3%9D%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E6%B1%BD%E6%B0%B4-%E6%96%B0%E8%88%8A%E5%8C%85%E8%A3%9D%E9%9A%A8%E6%A9%9F%E7%99%BC%E9%80%81/p/H0888001_S_P10021200"
+HKTVMALL_PRICE_LIMIT = 79.90
+HKTVMALL_HTTP_TIMEOUT = 45_000
+
 
 def load_facebook_pages():
     """Read a deduplicated Facebook URL list from one environment variable.
@@ -260,6 +264,7 @@ def load_state():
     state["monitors"].setdefault("owndays", {})
     state["monitors"].setdefault("fb", {})
     state["monitors"].setdefault("eprice", {})
+    state["monitors"].setdefault("hktvmall", {})
     state["monitors"].pop("levis", None)  # Retired permanently.
     state["system"].setdefault("total_runs", 0)
     state["system"]["timezone"] = "Asia/Hong_Kong (UTC+8)"
@@ -413,6 +418,76 @@ def check_owndays(page, state):
     except Exception as exc:
         monitor["status"] = f"ERROR: Owndays fetch/check failed; prior state preserved ({str(exc)[:120]})"
         log_event(state, "OWNDAYS", monitor["status"])
+
+    return state
+
+
+# -----------------------------------------------------------------------------
+# HKTVmall: alert once when the monitored product drops below the price limit
+# -----------------------------------------------------------------------------
+def check_hktvmall_price(page, state):
+    """Read the public HKTVmall product page and alert on a price crossing."""
+    monitor = state["monitors"]["hktvmall"]
+    monitor.setdefault("below_threshold", False)
+    monitor.setdefault("status", "Initializing")
+    monitor["last_check"] = get_hk_time()
+
+    try:
+        response = page.goto(HKTVMALL_PRODUCT_URL, timeout=HKTVMALL_HTTP_TIMEOUT, wait_until="domcontentloaded")
+        page.locator("body").wait_for(state="visible", timeout=15000)
+        visible_text = page.locator("body").inner_text(timeout=15000)
+        normalized_text = shorten(visible_text, 100000)
+        update_fetch_details(monitor, response, page, normalized_text, HKTVMALL_PRODUCT_URL)
+
+        if page_looks_blocked(page, normalized_text):
+            monitor["status"] = "BLOCKED: HKTVmall showed a CAPTCHA/access check; prior price state preserved"
+            log_event(state, "HKTVMALL", monitor["status"])
+            return state
+
+        price_matches = re.findall(
+            r"HKTV\s*[＄$]?\s*([0-9]+(?:,[0-9]{3})*(?:\.\d{1,2})?)",
+            normalized_text,
+            flags=re.IGNORECASE,
+        )
+        if not price_matches:
+            monitor["status"] = "UNVERIFIED: HKTVmall price was not found; prior price state preserved"
+            log_event(state, "HKTVMALL", monitor["status"])
+            return state
+
+        price = float(price_matches[0].replace(",", ""))
+        below_threshold = price < HKTVMALL_PRICE_LIMIT
+        monitor["last_price_hkd"] = price
+        monitor["price_limit_hkd"] = HKTVMALL_PRICE_LIMIT
+
+        if not below_threshold:
+            monitor["below_threshold"] = False
+            monitor["status"] = f"OK: HKTVmall price HK${price:.2f}; threshold is below HK${HKTVMALL_PRICE_LIMIT:.2f}"
+            log_event(state, "HKTVMALL", monitor["status"])
+            return state
+
+        if monitor["below_threshold"]:
+            monitor["status"] = f"OK: HKTVmall price remains below threshold at HK${price:.2f}; alert already sent"
+            log_event(state, "HKTVMALL", monitor["status"])
+            return state
+
+        success = send_email(
+            f"[ALERT] HKTVmall Coca-Cola price below HK${HKTVMALL_PRICE_LIMIT:.2f}",
+            f"The monitored HKTVmall product is below your price threshold.\n\n"
+            f"Product: {HKTVMALL_PRODUCT_URL}\n"
+            f"Current price: HK${price:.2f}\n"
+            f"Alert threshold: below HK${HKTVMALL_PRICE_LIMIT:.2f}\n\n"
+            f"Checked: {get_hk_time()}",
+        )
+        if success:
+            monitor["below_threshold"] = True
+            monitor["status"] = f"ALERTING: HKTVmall price HK${price:.2f} is below threshold; email sent"
+            log_event(state, "HKTVMALL", monitor["status"])
+        else:
+            monitor["status"] = f"EMAIL FAILED: HKTVmall price HK${price:.2f} is below threshold; will retry"
+            log_event(state, "HKTVMALL", monitor["status"])
+    except Exception as exc:
+        monitor["status"] = f"ERROR: HKTVmall fetch/check failed; prior price state preserved ({str(exc)[:120]})"
+        log_event(state, "HKTVMALL", monitor["status"])
 
     return state
 
@@ -706,7 +781,9 @@ def main():
             )
 
             owndays_page = context.new_page()
+            hktvmall_page = context.new_page()
             facebook_page = context.new_page()
+            state = check_hktvmall_price(hktvmall_page, state)
             state = check_owndays(owndays_page, state)
             for facebook_url in FB_PAGES:
                 state = check_facebook(facebook_page, facebook_url, state)
@@ -721,10 +798,12 @@ def main():
     log_event(state, "SYSTEM", "Monitoring cycle complete.")
     save_state(state)
 
-    # Printed inside GitHub Actions → monitor → Run monitoring script.
-    print("\n--- FINAL STATE REPORT (state.json) ---", flush=True)
-    print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
-    print("--- END STATE REPORT ---\n", flush=True)
+    # Full state may contain Facebook post text and diagnostics. Keep it out of
+    # GitHub Actions logs by default; enable explicitly for private debugging.
+    if os.environ.get("PRINT_STATE_REPORT", "false").lower() == "true":
+        print("\n--- FINAL STATE REPORT (state.json) ---", flush=True)
+        print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
+        print("--- END STATE REPORT ---\n", flush=True)
 
 
 

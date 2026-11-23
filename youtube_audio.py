@@ -80,6 +80,7 @@ RESET_CHANNELS = {
     if value.strip()
 }
 MAX_HISTORY = 100
+MAX_UNAVAILABLE_RETRIES = 24  # About 6 hours with a 15-minute workflow schedule.
 MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 15 * 60
 USER_AGENT = "Mozilla/5.0 (compatible; PersonalYouTubeAudioMonitor/1.0)"
@@ -287,6 +288,17 @@ def is_youtube_temporary_error(error: Exception) -> bool:
     return bot_challenge or scheduled_premiere or no_player_response
 
 
+def is_youtube_retryable_unavailable_error(error: Exception) -> bool:
+    """Identify rate limits and availability responses worth retrying later."""
+    text = str(error).casefold().replace("’", "'")
+    return (
+        "http error 429" in text
+        or "too many requests" in text
+        or "video unavailable" in text
+        or "this content isn't available" in text
+    )
+
+
 def create_audio(video: dict, workdir: Path) -> Path:
     if not shutil.which("yt-dlp"):
         raise RuntimeError("yt-dlp is not installed")
@@ -384,6 +396,7 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         raise RuntimeError("channel RSS feed contained no videos")
 
     channel_state = state["channels"].setdefault(channel_name, {"seen_ids": []})
+    retry_counts = channel_state.setdefault("retry_counts", {})
     if channel_name.casefold() in RESET_CHANNELS:
         channel_state["seen_ids"] = []
         log(f"{channel_name}: one-time reset requested; existing IDs will be re-evaluated")
@@ -484,6 +497,35 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
                 audio_bytes = audio_path.stat().st_size
                 send_email(channel_name, video, audio_path)
         except Exception as exc:
+            if is_youtube_retryable_unavailable_error(exc):
+                retry_count = int(retry_counts.get(video["id"], 0)) + 1
+                if retry_count >= MAX_UNAVAILABLE_RETRIES:
+                    seen.add(video["id"])
+                    retry_counts.pop(video["id"], None)
+                    channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
+                    channel_state["skipped_unavailable_count"] = channel_state.get("skipped_unavailable_count", 0) + 1
+                    channel_state["status"] = (
+                        f"permanently skipped unavailable video {video['id']} "
+                        f"after {MAX_UNAVAILABLE_RETRIES} retries"
+                    )
+                    save_state(state)
+                    log(
+                        f"{channel_name}: permanently skipped {video['id']} after "
+                        f"{MAX_UNAVAILABLE_RETRIES} unavailable/rate-limit retries"
+                    )
+                else:
+                    retry_counts[video["id"]] = retry_count
+                    channel_state["status"] = (
+                        f"deferred unavailable/rate-limited video {video['id']} "
+                        f"(retry {retry_count}/{MAX_UNAVAILABLE_RETRIES})"
+                    )
+                    save_state(state)
+                    log(
+                        f"{channel_name}: WARNING deferred {video['id']} due to YouTube "
+                        f"429/unavailable response; retry {retry_count}/{MAX_UNAVAILABLE_RETRIES}; "
+                        "workflow will not be marked failed"
+                    )
+                continue
             if is_youtube_temporary_error(exc):
                 deferred += 1
                 channel_state["status"] = f"deferred YouTube bot challenge: {video['id']}"
@@ -501,6 +543,7 @@ def process_channel(state: dict, channel_name: str, config: dict) -> None:
         # Checkpoint after every successful delivery. If a later video fails,
         # earlier successful emails are not sent again on the next run.
         seen.add(video["id"])
+        retry_counts.pop(video["id"], None)
         processed += 1
         channel_state["seen_ids"] = list(seen)[-MAX_HISTORY:]
         channel_state["latest_id"] = video["id"]

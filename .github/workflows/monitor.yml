@@ -56,6 +56,7 @@ jobs:
           FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
           FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}
           FB_SKIP_TERMS_AILLYNOTES: ${{ vars.FB_SKIP_TERMS_AILLYNOTES }}
+          JETSO_SKIP_TERMS: ${{ vars.JETSO_SKIP_TERMS }}
           STOP_ALERTS: ${{ vars.STOP_ALERTS }}
           # Prevent Facebook post text and diagnostics from appearing in logs.
           PRINT_STATE_REPORT: "false"

@@ -33,6 +33,9 @@ EPRICE_HTTP_TIMEOUT = 30
 JETSO_RSS_URL = "https://www.jetsoclub.com/feeds/posts/default?alt=rss&max-results=40"
 JETSO_BATCH_SIZE = 4
 JETSO_MAX_SAVED_GUIDS = 200
+JETSO_ARTICLE_RETRIES = 3
+JETSO_ARTICLE_DELAY_SECONDS = 1.25
+JETSO_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 HKTVMALL_PRODUCT_URL = "https://www.hktvmall.com/hktv/zh/main/%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E5%AE%98%E6%96%B9%E6%97%97%E8%89%A6%E5%BA%97/s/H1108001/%E8%B6%85%E7%B4%9A%E5%B7%BF%E5%A0%B4/%E8%B6%85%E7%B4%9A%E5%B8%82%E5%A0%B4/%E9%A3%B2%E5%93%81-%E5%8D%B3%E6%B2%96%E9%A3%B2%E5%93%81/%E6%B1%BD%E6%B0%B4/%E5%8E%9F%E7%AE%B1-%E7%BD%90%E8%A3%9D%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E6%B1%BD%E6%B0%B4-%E6%96%B0%E8%88%8A%E5%8C%85%E8%A3%9D%E9%9A%A8%E6%A9%9F%E7%99%BC%E9%80%81/p/H0888001_S_P10021200"
 HKTVMALL_PRICE_LIMIT = 79.90
@@ -1092,20 +1095,59 @@ class JetsoArticleTextParser(HTMLParser):
             self.parts.append(data)
 
 
+def fetch_jetsoclub_url(url, headers=None):
+    """Fetch a JetsoClub resource with bounded retries for rate limiting/server errors."""
+    last_error = None
+    for attempt in range(JETSO_ARTICLE_RETRIES):
+        try:
+            status, response_headers, payload = eprice_http_get(url, headers)
+            if status == 429 or status >= 500:
+                raise HTTPError(url, status, f"HTTP {status}", response_headers, None)
+            return status, response_headers, payload
+        except HTTPError as exc:
+            last_error = exc
+            retryable = exc.code == 429 or exc.code >= 500
+            if not retryable or attempt == JETSO_ARTICLE_RETRIES - 1:
+                raise
+            retry_after = 0
+            try:
+                retry_after = int(exc.headers.get("Retry-After", "0"))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            delay = min(12.0, max(float(retry_after), 2.0 ** attempt))
+            print(
+                f"[JETSOCLUB] HTTP {exc.code} for {url}; retrying in {delay:.1f}s "
+                f"({attempt + 1}/{JETSO_ARTICLE_RETRIES - 1})",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise last_error or RuntimeError(f"JetsoClub fetch failed: {url}")
+
+
+def clean_jetsoclub_article_text(raw_text):
+    """Remove Blogger sharing/navigation leakage while preserving article text."""
+    cleaned_lines = []
+    stop_lines = {"share", "older post", "newer post", "home", "comments"}
+    for line in clean_article_text(raw_text).splitlines():
+        normalized = line.strip().casefold()
+        if normalized in stop_lines:
+            break
+        cleaned_lines.append(line)
+    return clean_article_text("\n".join(cleaned_lines))
+
+
 def fetch_jetsoclub_article_content(item):
     """Fetch readable post-body text and the first post-body image URL."""
-    status, _headers, payload = eprice_http_get(item["link"])
+    status, _headers, payload = fetch_jetsoclub_url(
+        item["link"],
+        {"Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "Referer": "https://www.jetsoclub.com/"},
+    )
     if status != 200:
         raise RuntimeError(f"article HTTP status {status}")
     parser = JetsoArticleTextParser()
     parser.feed(payload.decode("utf-8", errors="replace"))
     parser.close()
-    text = clean_article_text("".join(parser.parts))
-    # Some older Blogger templates leave the post-body container unbalanced.
-    # Stop before its sharing/navigation/sidebar text if that leaks through.
-    for marker in ("\nShare\n", "\nOlder Post\n", "\n熱門著數優惠"):
-        if marker in text:
-            text = text.split(marker, 1)[0].rstrip()
+    text = clean_jetsoclub_article_text("".join(parser.parts))
     if not text:
         raise RuntimeError("JetsoClub post-body text was empty")
     image_url = urljoin(item["link"], parser.image_urls[0]) if parser.image_urls else ""
@@ -1119,7 +1161,7 @@ def fetch_jetsoclub_article_text(item):
 
 def build_jetsoclub_email(items, article_texts=None):
     """Build the plain-text fallback for one four-item digest batch."""
-    lines = ["JetsoClub 最新情報", "=" * 24, ""]
+    lines = []
     for index, item in enumerate(items, start=1):
         lines.extend([f"{index}. {item['title']}"])
         article_text = (article_texts or {}).get(item["guid"])
@@ -1136,7 +1178,6 @@ def build_jetsoclub_html_email(items, article_contents, image_cids=None):
     """Build an HTML digest with each downloaded image below its article text."""
     sections = [
         '<html><body style="font-family:Arial,sans-serif;line-height:1.6">',
-        "<h2>JetsoClub 最新情報</h2>",
     ]
     image_cids = image_cids or {}
     for index, item in enumerate(items, start=1):
@@ -1149,9 +1190,9 @@ def build_jetsoclub_html_email(items, article_contents, image_cids=None):
         ])
         cid = image_cids.get(item["guid"])
         if cid:
-            sections.append(f'<p><img src="cid:{escape(cid)}" alt="{escape(item["title"])}" style="max-width:100%;height:auto"></p>')
+            sections.append(f'<p style="text-align:center"><img src="cid:{escape(cid)}" alt="{escape(item["title"])}" style="display:block;max-width:100%;height:auto;margin:12px auto"></p>')
         sections.extend([
-            f'<p><a href="{escape(item["link"], quote=True)}">查看文章</a></p>',
+            f'<p><a href="{escape(item["link"], quote=True)}" target="_blank" rel="noopener noreferrer">查看文章</a></p>',
             "<hr>",
         ])
     sections.extend([f"<p>Checked: {escape(get_hk_time())}</p>", "</body></html>"])
@@ -1162,9 +1203,9 @@ def download_jetsoclub_inline_image(image_url):
     """Download a valid article image, returning bytes and MIME subtype."""
     if not image_url:
         return None
-    status, headers, payload = eprice_http_get(image_url)
+    status, headers, payload = fetch_jetsoclub_url(image_url, {"Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8", "Referer": "https://www.jetsoclub.com/"})
     content_type = headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
-    if status != 200 or not content_type.startswith("image/") or len(payload) > 8 * 1024 * 1024:
+    if status != 200 or not content_type.startswith("image/") or len(payload) > JETSO_MAX_IMAGE_BYTES:
         return None
     subtype = content_type.split("/", 1)[1]
     if subtype == "jpg":
@@ -1247,13 +1288,19 @@ def check_jetsoclub(state):
         log_event(state, "JETSOCLUB", monitor["status"])
         return state
 
-    batch = pending[:JETSO_BATCH_SIZE]
+    # pending is kept oldest-to-newest. Send the newest four first so a burst
+    # of uploads immediately produces a digest of the genuinely latest titles;
+    # older pending entries remain queued for subsequent runs.
+    batch = pending[-JETSO_BATCH_SIZE:]
+    pending_remainder = pending[:-JETSO_BATCH_SIZE]
     article_contents = {}
     article_texts = {}
     inline_images = []
     image_cids = {}
-    for item in batch:
+    for index, item in enumerate(batch):
         try:
+            if index:
+                time.sleep(JETSO_ARTICLE_DELAY_SECONDS)
             content = fetch_jetsoclub_article_content(item)
             article_contents[item["guid"]] = content
             article_texts[item["guid"]] = content["text"]
@@ -1267,7 +1314,7 @@ def check_jetsoclub(state):
             log_event(state, "JETSOCLUB", f"Article text fetch failed for {item['link']}; title/link retained ({str(exc)[:120]})")
 
     success = send_html_email(
-        f"JetsoClub: {JETSO_BATCH_SIZE} new titles",
+        "JetsoClub 最新情報",
         build_jetsoclub_email(batch, article_texts),
         build_jetsoclub_html_email(batch, article_contents, image_cids),
         inline_images,
@@ -1279,7 +1326,7 @@ def check_jetsoclub(state):
 
     seen.update(item["guid"] for item in batch)
     monitor["seen_guids"] = list(seen)[-JETSO_MAX_SAVED_GUIDS:]
-    monitor["pending_items"] = pending[JETSO_BATCH_SIZE:]
+    monitor["pending_items"] = pending_remainder
     monitor["latest_guid"] = batch[-1]["guid"]
     monitor["latest_title"] = batch[-1]["title"]
     monitor["status"] = f"ALERTING: JetsoClub digest of {JETSO_BATCH_SIZE} new title(s) sent"

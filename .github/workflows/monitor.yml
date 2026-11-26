@@ -50,17 +50,13 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          CLEAN_SENT_ALERTS: ${{ vars.CLEAN_SENT_ALERTS }}
           FB_PAGES: ${{ vars.FB_PAGES }}
-          FB_PAGE_1: ${{ secrets.FB_PAGE_1 }}
-          FB_PAGE_2: ${{ secrets.FB_PAGE_2 }}
-          FB_PAGE_3: ${{ secrets.FB_PAGE_3 }}
           FB_SKIP_TERMS_AILLYNOTES: ${{ vars.FB_SKIP_TERMS_AILLYNOTES }}
           JETSO_SKIP_TERMS: ${{ vars.JETSO_SKIP_TERMS }}
           STOP_ALERTS: ${{ vars.STOP_ALERTS }}
           # Prevent Facebook post text and diagnostics from appearing in logs.
           PRINT_STATE_REPORT: "false"
-        run: python3 main.py
+        run: python3 monitor.py
 
       - name: Save state memory
         if: always()

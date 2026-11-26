@@ -1,4 +1,3 @@
-import imaplib
 import hashlib
 import json
 import os
@@ -7,10 +6,11 @@ import smtplib
 import time
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import make_msgid, parsedate_to_datetime
-from html import unescape
+from html import escape, unescape
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -25,16 +25,13 @@ from playwright.sync_api import sync_playwright
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASS = os.environ.get("EMAIL_PASS")
 RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL")
-# Opt-in only. Set GitHub repository variable CLEAN_SENT_ALERTS=true to remove
-# the Sent label from each alert after confirmed SMTP delivery.
-CLEAN_SENT_ALERTS = os.environ.get("CLEAN_SENT_ALERTS", "false").lower() == "true"
 
 EPRICE_RSS_URL = "https://www.eprice.com.hk/news/rss.xml"
 EPRICE_BOOTSTRAP_ALERT = os.environ.get("EPRICE_BOOTSTRAP_ALERT", "false").lower() == "true"
 EPRICE_MAX_SAVED_GUIDS = 100
 EPRICE_HTTP_TIMEOUT = 30
 JETSO_RSS_URL = "https://www.jetsoclub.com/feeds/posts/default?alt=rss&max-results=40"
-JETSO_BATCH_SIZE = 6
+JETSO_BATCH_SIZE = 4
 JETSO_MAX_SAVED_GUIDS = 200
 
 HKTVMALL_PRODUCT_URL = "https://www.hktvmall.com/hktv/zh/main/%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E5%AE%98%E6%96%B9%E6%97%97%E8%89%A6%E5%BA%97/s/H1108001/%E8%B6%85%E7%B4%9A%E5%B7%BF%E5%A0%B4/%E8%B6%85%E7%B4%9A%E5%B8%82%E5%A0%B4/%E9%A3%B2%E5%93%81-%E5%8D%B3%E6%B2%96%E9%A3%B2%E5%93%81/%E6%B1%BD%E6%B0%B4/%E5%8E%9F%E7%AE%B1-%E7%BD%90%E8%A3%9D%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E6%B1%BD%E6%B0%B4-%E6%96%B0%E8%88%8A%E5%8C%85%E8%A3%9D%E9%9A%A8%E6%A9%9F%E7%99%BC%E9%80%81/p/H0888001_S_P10021200"
@@ -46,8 +43,7 @@ def load_facebook_pages():
     """Read a deduplicated Facebook URL list from one environment variable.
 
     FB_PAGES accepts newline-separated or comma-separated URLs. A JSON array
-    is accepted too. The old FB_PAGE_1..FB_PAGE_20 variables remain a fallback
-    so existing repositories continue working during migration.
+    is accepted too.
     """
     configured = os.environ.get("FB_PAGES", "").strip()
     if configured:
@@ -57,7 +53,7 @@ def load_facebook_pages():
         except json.JSONDecodeError:
             raw_values = re.split(r"[\n,]", configured)
     else:
-        raw_values = [os.environ.get(f"FB_PAGE_{number}", "") for number in range(1, 21)]
+        raw_values = []
 
     pages = []
     seen = set()
@@ -161,102 +157,58 @@ def log_event(state, category, message):
     state["history"] = state["history"][-100:]
 
 
-def find_gmail_sent_mailbox(imap_client):
-    """Discover the locale-independent Gmail Sent mailbox through its \\Sent flag."""
-    status, folders = imap_client.list()
-    if status != "OK":
-        raise RuntimeError("Gmail IMAP folder list was unavailable")
-
-    for raw_folder in folders or []:
-        folder_line = raw_folder.decode("utf-8", errors="replace")
-        if "\\Sent" in folder_line:
-            # Preserve the final quoted IMAP mailbox name, including spaces;
-            # e.g. "[Gmail]/Sent Mail" rather than only its final word.
-            quoted_mailbox = re.search(r'("[^"]*")$', folder_line)
-            if quoted_mailbox:
-                return quoted_mailbox.group(1)
-            return folder_line.rsplit(" ", 1)[-1]
-
-    raise RuntimeError("Gmail Sent mailbox with \\Sent special-use flag was not found")
-
-
-def remove_sent_label_from_alert(message_id):
-    """Remove the Sent label from precisely one SMTP-created alert message."""
-    if not CLEAN_SENT_ALERTS:
-        return
-
-    try:
-        with imaplib.IMAP4_SSL("imap.gmail.com", 993, timeout=30) as imap_client:
-            imap_client.login(EMAIL_USER, EMAIL_PASS)
-            sent_mailbox = find_gmail_sent_mailbox(imap_client)
-            status, _ = imap_client.select(sent_mailbox, readonly=False)
-            if status != "OK":
-                raise RuntimeError("Could not select Gmail Sent mailbox")
-
-            # Gmail may write the SMTP copy shortly after sendmail returns.
-            # Search only for this unique RFC Message-ID, never by broad subject.
-            for attempt in range(1, 6):
-                status, data = imap_client.uid(
-                    "SEARCH", None, "HEADER", "Message-ID", f'"{message_id}"'
-                )
-                if status == "OK" and data and data[0]:
-                    uids = data[0].split()
-                    for uid in uids:
-                        status, _ = imap_client.uid(
-                            "STORE", uid, "-X-GM-LABELS", r"(\Sent)"
-                        )
-                        if status != "OK":
-                            raise RuntimeError("Could not remove Gmail Sent label")
-                    print(
-                        f"[IMAP] Removed Sent label from alert Message-ID {message_id}.",
-                        flush=True,
-                    )
-                    return
-
-                if attempt < 5:
-                    time.sleep(1)
-
-            print(
-                "[IMAP] Alert email was sent, but its Sent copy was not found within 5 seconds; "
-                "no message was changed.",
-                flush=True,
-            )
-    except Exception as exc:
-        # A cleanup failure must never make an already-sent alert retry and
-        # create a duplicate alert. It affects only Sent-folder convenience.
-        print(f"[IMAP] Sent-label cleanup skipped: {type(exc).__name__}: {exc}", flush=True)
-
-
-def send_email(subject, body):
-    """Send a UTF-8 Gmail alert; optionally remove only its Sent-label copy."""
+def _send_message(message, subject):
+    """Deliver one already-built message through Gmail SMTP."""
     if not (EMAIL_USER and EMAIL_PASS and RECEIVER_EMAIL):
         print("[EMAIL] Credentials are missing: check EMAIL_USER, EMAIL_PASS, RECEIVER_EMAIL.", flush=True)
         return False
-
     try:
-        message = MIMEMultipart()
-        message_id = make_msgid(domain=EMAIL_USER.rsplit("@", 1)[-1])
-        message["Message-ID"] = message_id
-        message["X-Alert-Monitor"] = "github-actions"
-        message["Subject"] = subject
-        message["From"] = EMAIL_USER
-        message["To"] = RECEIVER_EMAIL
-        message.attach(MIMEText(body, "plain", "utf-8"))
-
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
             server.login(EMAIL_USER, EMAIL_PASS)
             server.sendmail(EMAIL_USER, [RECEIVER_EMAIL], message.as_string())
-
         print(f"[EMAIL] Sent successfully to {RECEIVER_EMAIL}: {subject}", flush=True)
-        remove_sent_label_from_alert(message_id)
         return True
     except Exception as exc:
         print(f"[EMAIL] FAILED: {type(exc).__name__}: {exc}", flush=True)
         return False
 
 
+def _message_headers(message, subject):
+    """Apply common alert headers to a MIME message."""
+    sender = EMAIL_USER or "alert-monitor@example.invalid"
+    message["Message-ID"] = make_msgid(domain=sender.rsplit("@", 1)[-1])
+    message["X-Alert-Monitor"] = "github-actions"
+    message["Subject"] = subject
+    message["From"] = sender
+    message["To"] = RECEIVER_EMAIL
+
+
+def send_email(subject, body):
+    """Send a UTF-8 plain-text Gmail alert."""
+    message = MIMEMultipart()
+    _message_headers(message, subject)
+    message.attach(MIMEText(body, "plain", "utf-8"))
+    return _send_message(message, subject)
+
+
+def send_html_email(subject, text_body, html_body, inline_images=None):
+    """Send text/HTML email with downloaded images rendered inline."""
+    message = MIMEMultipart("related")
+    _message_headers(message, subject)
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText(text_body, "plain", "utf-8"))
+    alternative.attach(MIMEText(html_body, "html", "utf-8"))
+    message.attach(alternative)
+    for cid, image_data, image_subtype in inline_images or []:
+        image = MIMEImage(image_data, _subtype=image_subtype or "jpeg")
+        image.add_header("Content-ID", f"<{cid}>")
+        image.add_header("Content-Disposition", "inline")
+        message.attach(image)
+    return _send_message(message, subject)
+
+
 def load_state():
-    """Load state.json and remove the retired Levi's monitor from existing cache state."""
+    """Load state.json and initialize active monitor state."""
     default_state = {
         "system": {
             "last_run": "",
@@ -286,7 +238,6 @@ def load_state():
     state["monitors"].setdefault("eprice", {})
     state["monitors"].setdefault("hktvmall", {})
     state["monitors"].setdefault("jetsoclub", {})
-    state["monitors"].pop("levis", None)  # Retired permanently.
     state["system"].setdefault("total_runs", 0)
     state["system"]["timezone"] = "Asia/Hong_Kong (UTC+8)"
     return state
@@ -1098,7 +1049,7 @@ def parse_jetsoclub_feed(payload):
 
 
 class JetsoArticleTextParser(HTMLParser):
-    """Extract only Blogger's post-body text, excluding images and page chrome."""
+    """Extract post-body text and its first relevant image, excluding page chrome."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -1106,11 +1057,18 @@ class JetsoArticleTextParser(HTMLParser):
         self.target_depth = None
         self.ignored_depth = 0
         self.parts = []
+        self.image_urls = []
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         self.depth += 1
-        if tag.casefold() in {"script", "style", "noscript", "svg", "img", "iframe"}:
+        if tag.casefold() == "img" and self.target_depth is not None and not self.ignored_depth:
+            source = (attrs.get("src") or attrs.get("data-src") or "").strip()
+            if source and not source.startswith("data:"):
+                self.image_urls.append(source)
+        if tag.casefold() == "img":
+            return
+        if tag.casefold() in {"script", "style", "noscript", "svg", "iframe"}:
             self.ignored_depth += 1
             return
         classes = set((attrs.get("class") or "").split())
@@ -1121,7 +1079,7 @@ class JetsoArticleTextParser(HTMLParser):
 
     def handle_endtag(self, tag):
         tag = tag.casefold()
-        if tag in {"script", "style", "noscript", "svg", "img", "iframe"} and self.ignored_depth:
+        if tag in {"script", "style", "noscript", "svg", "iframe"} and self.ignored_depth:
             self.ignored_depth -= 1
         if self.target_depth is not None and self.ignored_depth == 0 and tag in ArticleTextParser.BLOCK_TAGS:
             self.parts.append("\n")
@@ -1134,8 +1092,8 @@ class JetsoArticleTextParser(HTMLParser):
             self.parts.append(data)
 
 
-def fetch_jetsoclub_article_text(item):
-    """Fetch readable post-body text without images or navigation."""
+def fetch_jetsoclub_article_content(item):
+    """Fetch readable post-body text and the first post-body image URL."""
     status, _headers, payload = eprice_http_get(item["link"])
     if status != 200:
         raise RuntimeError(f"article HTTP status {status}")
@@ -1150,11 +1108,17 @@ def fetch_jetsoclub_article_text(item):
             text = text.split(marker, 1)[0].rstrip()
     if not text:
         raise RuntimeError("JetsoClub post-body text was empty")
-    return text[:5000]
+    image_url = urljoin(item["link"], parser.image_urls[0]) if parser.image_urls else ""
+    return {"text": text[:5000], "image_url": image_url}
+
+
+def fetch_jetsoclub_article_text(item):
+    """Backward-compatible text-only helper for article extraction tests."""
+    return fetch_jetsoclub_article_content(item)["text"]
 
 
 def build_jetsoclub_email(items, article_texts=None):
-    """Build a compact text-only title-to-link digest for one six-item batch."""
+    """Build the plain-text fallback for one four-item digest batch."""
     lines = ["JetsoClub 最新情報", "=" * 24, ""]
     for index, item in enumerate(items, start=1):
         lines.extend([f"{index}. {item['title']}"])
@@ -1166,6 +1130,50 @@ def build_jetsoclub_email(items, article_texts=None):
         lines.extend([f"   連結: {item['link']}", ""])
     lines.append(f"Checked: {get_hk_time()}")
     return "\n".join(lines)
+
+
+def build_jetsoclub_html_email(items, article_contents, image_cids=None):
+    """Build an HTML digest with each downloaded image below its article text."""
+    sections = [
+        '<html><body style="font-family:Arial,sans-serif;line-height:1.6">',
+        "<h2>JetsoClub 最新情報</h2>",
+    ]
+    image_cids = image_cids or {}
+    for index, item in enumerate(items, start=1):
+        content = article_contents.get(item["guid"], {})
+        text = content.get("text") or "暫時未能讀取文章文字"
+        paragraphs = "<br>".join(escape(text).splitlines())
+        sections.extend([
+            f'<h3>{index}. {escape(item["title"])}</h3>',
+            f'<div>{paragraphs}</div>',
+        ])
+        cid = image_cids.get(item["guid"])
+        if cid:
+            sections.append(f'<p><img src="cid:{escape(cid)}" alt="{escape(item["title"])}" style="max-width:100%;height:auto"></p>')
+        sections.extend([
+            f'<p><a href="{escape(item["link"], quote=True)}">查看文章</a></p>',
+            "<hr>",
+        ])
+    sections.extend([f"<p>Checked: {escape(get_hk_time())}</p>", "</body></html>"])
+    return "\n".join(sections)
+
+
+def download_jetsoclub_inline_image(image_url):
+    """Download a valid article image, returning bytes and MIME subtype."""
+    if not image_url:
+        return None
+    status, headers, payload = eprice_http_get(image_url)
+    content_type = headers.get("Content-Type", "").split(";", 1)[0].strip().casefold()
+    if status != 200 or not content_type.startswith("image/") or len(payload) > 8 * 1024 * 1024:
+        return None
+    subtype = content_type.split("/", 1)[1]
+    if subtype == "jpg":
+        subtype = "jpeg"
+    try:
+        MIMEImage(payload, _subtype=subtype)
+    except (TypeError, ValueError):
+        return None
+    return payload, subtype
 
 
 def load_jetsoclub_skip_terms():
@@ -1180,7 +1188,7 @@ def load_jetsoclub_skip_terms():
 
 
 def check_jetsoclub(state):
-    """Queue JetsoClub titles and email one digest per six new entries."""
+    """Queue JetsoClub titles and email one digest per four new entries."""
     monitor = state["monitors"]["jetsoclub"]
     monitor.setdefault("seen_guids", [])
     monitor.setdefault("pending_items", [])
@@ -1240,16 +1248,29 @@ def check_jetsoclub(state):
         return state
 
     batch = pending[:JETSO_BATCH_SIZE]
+    article_contents = {}
     article_texts = {}
+    inline_images = []
+    image_cids = {}
     for item in batch:
         try:
-            article_texts[item["guid"]] = fetch_jetsoclub_article_text(item)
+            content = fetch_jetsoclub_article_content(item)
+            article_contents[item["guid"]] = content
+            article_texts[item["guid"]] = content["text"]
+            image_result = download_jetsoclub_inline_image(content.get("image_url", ""))
+            if image_result:
+                image_data, image_subtype = image_result
+                cid = "jetso-" + hashlib.sha256(item["guid"].encode("utf-8")).hexdigest()[:16]
+                image_cids[item["guid"]] = cid
+                inline_images.append((cid, image_data, image_subtype))
         except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as exc:
             log_event(state, "JETSOCLUB", f"Article text fetch failed for {item['link']}; title/link retained ({str(exc)[:120]})")
 
-    success = send_email(
+    success = send_html_email(
         f"JetsoClub: {JETSO_BATCH_SIZE} new titles",
         build_jetsoclub_email(batch, article_texts),
+        build_jetsoclub_html_email(batch, article_contents, image_cids),
+        inline_images,
     )
     if not success:
         monitor["status"] = "EMAIL FAILED: JetsoClub batch retained for retry"

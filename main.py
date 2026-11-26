@@ -14,6 +14,7 @@ from html import unescape
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
 
 from playwright.sync_api import sync_playwright
@@ -32,6 +33,9 @@ EPRICE_RSS_URL = "https://www.eprice.com.hk/news/rss.xml"
 EPRICE_BOOTSTRAP_ALERT = os.environ.get("EPRICE_BOOTSTRAP_ALERT", "false").lower() == "true"
 EPRICE_MAX_SAVED_GUIDS = 100
 EPRICE_HTTP_TIMEOUT = 30
+JETSO_RSS_URL = "https://www.jetsoclub.com/feeds/posts/default?alt=rss&max-results=40"
+JETSO_BATCH_SIZE = 6
+JETSO_MAX_SAVED_GUIDS = 200
 
 HKTVMALL_PRODUCT_URL = "https://www.hktvmall.com/hktv/zh/main/%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E5%AE%98%E6%96%B9%E6%97%97%E8%89%A6%E5%BA%97/s/H1108001/%E8%B6%85%E7%B4%9A%E5%B7%BF%E5%A0%B4/%E8%B6%85%E7%B4%9A%E5%B8%82%E5%A0%B4/%E9%A3%B2%E5%93%81-%E5%8D%B3%E6%B2%96%E9%A3%B2%E5%93%81/%E6%B1%BD%E6%B0%B4/%E5%8E%9F%E7%AE%B1-%E7%BD%90%E8%A3%9D%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E6%B1%BD%E6%B0%B4-%E6%96%B0%E8%88%8A%E5%8C%85%E8%A3%9D%E9%9A%A8%E6%A9%9F%E7%99%BC%E9%80%81/p/H0888001_S_P10021200"
 HKTVMALL_PRICE_LIMIT = 79.90
@@ -281,6 +285,7 @@ def load_state():
     state["monitors"].setdefault("fb", {})
     state["monitors"].setdefault("eprice", {})
     state["monitors"].setdefault("hktvmall", {})
+    state["monitors"].setdefault("jetsoclub", {})
     state["monitors"].pop("levis", None)  # Retired permanently.
     state["system"].setdefault("total_runs", 0)
     state["system"]["timezone"] = "Asia/Hong_Kong (UTC+8)"
@@ -797,6 +802,7 @@ def main():
     log_event(state, "SYSTEM", f"Monitoring cycle {state['system']['total_runs']} started.")
 
     state = check_eprice_rss(state)
+    state = check_jetsoclub(state)
 
     try:
         with sync_playwright() as playwright:
@@ -1055,6 +1061,209 @@ def build_eprice_email(item, full_text, fetch_note=""):
     if fetch_note:
         lines.extend(["", fetch_note])
     return "\n".join(lines)
+
+
+def parse_jetsoclub_feed(payload):
+    """Parse Blogger RSS/Atom entries into newest-first title/link records."""
+    root = ET.fromstring(payload)
+    items = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].casefold() not in {"item", "entry"}:
+            continue
+        values = {}
+        links = []
+        alternate_links = []
+        for child in list(element):
+            child_name = child.tag.rsplit("}", 1)[-1].casefold()
+            if child_name in {"title", "guid", "id", "pubdate", "published", "updated"}:
+                values[child_name] = "".join(child.itertext()).strip()
+            elif child_name == "link":
+                href = child.attrib.get("href", "").strip()
+                text = (child.text or "").strip()
+                if href:
+                    links.append(href)
+                    if child.attrib.get("rel", "").casefold() == "alternate":
+                        alternate_links.append(href)
+                elif text:
+                    links.append(text)
+        title = clean_article_text(values.get("title", ""))
+        link = urljoin("https://www.jetsoclub.com/", (alternate_links or links)[0]) if (alternate_links or links) else ""
+        if link.startswith("http://www.jetsoclub.com/"):
+            link = "https://" + link[len("http://"):]
+        guid = values.get("guid") or values.get("id") or link
+        published = values.get("pubdate") or values.get("published") or values.get("updated") or ""
+        if title and link and guid:
+            items.append({"guid": guid, "title": title, "link": link, "published": published})
+    return items
+
+
+class JetsoArticleTextParser(HTMLParser):
+    """Extract only Blogger's post-body text, excluding images and page chrome."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.target_depth = None
+        self.ignored_depth = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        self.depth += 1
+        if tag.casefold() in {"script", "style", "noscript", "svg", "img", "iframe"}:
+            self.ignored_depth += 1
+            return
+        classes = set((attrs.get("class") or "").split())
+        if self.target_depth is None and any("post-body" in value.casefold() for value in classes):
+            self.target_depth = self.depth
+        if self.target_depth is not None and self.ignored_depth == 0 and tag.casefold() in ArticleTextParser.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.casefold()
+        if tag in {"script", "style", "noscript", "svg", "img", "iframe"} and self.ignored_depth:
+            self.ignored_depth -= 1
+        if self.target_depth is not None and self.ignored_depth == 0 and tag in ArticleTextParser.BLOCK_TAGS:
+            self.parts.append("\n")
+        self.depth = max(0, self.depth - 1)
+        if self.target_depth is not None and self.depth < self.target_depth:
+            self.target_depth = None
+
+    def handle_data(self, data):
+        if self.target_depth is not None and self.ignored_depth == 0:
+            self.parts.append(data)
+
+
+def fetch_jetsoclub_article_text(item):
+    """Fetch readable post-body text without images or navigation."""
+    status, _headers, payload = eprice_http_get(item["link"])
+    if status != 200:
+        raise RuntimeError(f"article HTTP status {status}")
+    parser = JetsoArticleTextParser()
+    parser.feed(payload.decode("utf-8", errors="replace"))
+    parser.close()
+    text = clean_article_text("".join(parser.parts))
+    # Some older Blogger templates leave the post-body container unbalanced.
+    # Stop before its sharing/navigation/sidebar text if that leaks through.
+    for marker in ("\nShare\n", "\nOlder Post\n", "\n熱門著數優惠"):
+        if marker in text:
+            text = text.split(marker, 1)[0].rstrip()
+    if not text:
+        raise RuntimeError("JetsoClub post-body text was empty")
+    return text[:5000]
+
+
+def build_jetsoclub_email(items, article_texts=None):
+    """Build a compact text-only title-to-link digest for one six-item batch."""
+    lines = ["JetsoClub 最新情報", "=" * 24, ""]
+    for index, item in enumerate(items, start=1):
+        lines.extend([f"{index}. {item['title']}"])
+        article_text = (article_texts or {}).get(item["guid"])
+        if article_text:
+            lines.extend(["   內容:", f"   {article_text}"])
+        elif article_texts is not None:
+            lines.append("   內容: 暫時未能讀取文章文字")
+        lines.extend([f"   連結: {item['link']}", ""])
+    lines.append(f"Checked: {get_hk_time()}")
+    return "\n".join(lines)
+
+
+def load_jetsoclub_skip_terms():
+    """Read comma/newline-separated JetsoClub title exclusion phrases."""
+    raw_value = os.environ.get("JETSO_SKIP_TERMS", "")
+    try:
+        decoded = json.loads(raw_value)
+        raw_terms = decoded if isinstance(decoded, list) else re.split(r"[\n,]", raw_value)
+    except json.JSONDecodeError:
+        raw_terms = re.split(r"[\n,]", raw_value)
+    return [str(term).strip() for term in raw_terms if str(term).strip()]
+
+
+def check_jetsoclub(state):
+    """Queue JetsoClub titles and email one digest per six new entries."""
+    monitor = state["monitors"]["jetsoclub"]
+    monitor.setdefault("seen_guids", [])
+    monitor.setdefault("pending_items", [])
+    monitor.setdefault("status", "Initializing")
+    monitor["last_check"] = get_hk_time()
+    try:
+        status, headers, payload = eprice_http_get(JETSO_RSS_URL)
+        items = parse_jetsoclub_feed(payload)
+        if not items:
+            raise RuntimeError("JetsoClub feed contained no valid title-link entries")
+        monitor["fetch"] = {"when": get_hk_time(), "url": JETSO_RSS_URL, "http_status": status,
+                             "content_type": headers.get("Content-Type", ""), "bytes": len(payload)}
+    except (HTTPError, URLError, TimeoutError, OSError, ET.ParseError, RuntimeError) as exc:
+        monitor["status"] = f"ERROR: JetsoClub feed fetch/parse failed; pending items preserved ({str(exc)[:160]})"
+        log_event(state, "JETSOCLUB", monitor["status"])
+        return state
+
+    seen = set(monitor.get("seen_guids", []))
+    pending = monitor.get("pending_items", [])
+    skip_terms = load_jetsoclub_skip_terms()
+    monitor["skip_terms"] = skip_terms
+
+    if skip_terms:
+        kept_pending = []
+        for item in pending:
+            if any(term.casefold() in item["title"].casefold() for term in skip_terms):
+                seen.add(item["guid"])
+            else:
+                kept_pending.append(item)
+        pending = kept_pending
+
+    pending_ids = {item.get("guid") for item in pending}
+    if not seen and not pending:
+        monitor["seen_guids"] = [item["guid"] for item in items[:JETSO_MAX_SAVED_GUIDS]]
+        monitor["latest_guid"] = items[0]["guid"]
+        monitor["latest_title"] = items[0]["title"]
+        monitor["status"] = f"INITIALIZED: Saved {len(items)} existing JetsoClub title(s); no email sent"
+        log_event(state, "JETSOCLUB", monitor["status"])
+        return state
+
+    skipped_count = 0
+    for item in reversed(items):
+        if item["guid"] in seen or item["guid"] in pending_ids:
+            continue
+        if any(term.casefold() in item["title"].casefold() for term in skip_terms):
+            seen.add(item["guid"])
+            skipped_count += 1
+            continue
+        pending.append(item)
+    pending = pending[-JETSO_MAX_SAVED_GUIDS:]
+    monitor["seen_guids"] = list(seen)[-JETSO_MAX_SAVED_GUIDS:]
+    monitor["pending_items"] = pending
+    if len(pending) < JETSO_BATCH_SIZE:
+        skipped_note = f"; skipped {skipped_count} configured-term title(s)" if skipped_count else ""
+        monitor["status"] = f"OK: {len(pending)}/{JETSO_BATCH_SIZE} new JetsoClub title(s) queued; waiting for batch{skipped_note}"
+        log_event(state, "JETSOCLUB", monitor["status"])
+        return state
+
+    batch = pending[:JETSO_BATCH_SIZE]
+    article_texts = {}
+    for item in batch:
+        try:
+            article_texts[item["guid"]] = fetch_jetsoclub_article_text(item)
+        except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as exc:
+            log_event(state, "JETSOCLUB", f"Article text fetch failed for {item['link']}; title/link retained ({str(exc)[:120]})")
+
+    success = send_email(
+        f"JetsoClub: {JETSO_BATCH_SIZE} new titles",
+        build_jetsoclub_email(batch, article_texts),
+    )
+    if not success:
+        monitor["status"] = "EMAIL FAILED: JetsoClub batch retained for retry"
+        log_event(state, "JETSOCLUB", monitor["status"])
+        return state
+
+    seen.update(item["guid"] for item in batch)
+    monitor["seen_guids"] = list(seen)[-JETSO_MAX_SAVED_GUIDS:]
+    monitor["pending_items"] = pending[JETSO_BATCH_SIZE:]
+    monitor["latest_guid"] = batch[-1]["guid"]
+    monitor["latest_title"] = batch[-1]["title"]
+    monitor["status"] = f"ALERTING: JetsoClub digest of {JETSO_BATCH_SIZE} new title(s) sent"
+    log_event(state, "JETSOCLUB", monitor["status"])
+    return state
 
 
 def check_eprice_rss(state):

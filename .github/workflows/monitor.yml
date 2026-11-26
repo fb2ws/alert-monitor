@@ -56,7 +56,7 @@ jobs:
           STOP_ALERTS: ${{ vars.STOP_ALERTS }}
           # Prevent Facebook post text and diagnostics from appearing in logs.
           PRINT_STATE_REPORT: "false"
-        run: python3 monitor.py
+        run: python3 main.py
 
       - name: Save state memory
         if: always()

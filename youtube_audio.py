@@ -92,6 +92,8 @@ CHANNEL_PAUSE_MIN = max(0.0, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MIN", "
 CHANNEL_PAUSE_MAX = max(CHANNEL_PAUSE_MIN, float(os.environ.get("YOUTUBE_CHANNEL_PAUSE_MAX", "30")))
 METADATA_PAUSE_MIN = max(0.0, float(os.environ.get("YOUTUBE_METADATA_PAUSE_MIN", "3")))
 METADATA_PAUSE_MAX = max(METADATA_PAUSE_MIN, float(os.environ.get("YOUTUBE_METADATA_PAUSE_MAX", "10")))
+RSS_RETRIES = 4
+RSS_BACKOFF_MAX_SECONDS = 20.0
 
 
 def log(message: str) -> None:
@@ -129,12 +131,41 @@ def save_state(state: dict) -> None:
 
 def fetch_feed(channel_id: str) -> list[dict]:
     url = RSS_TEMPLATE.format(channel_id)
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/atom+xml"})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = response.read()
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"RSS request failed: {exc}") from exc
+    payload = None
+    last_error = None
+    for attempt in range(RSS_RETRIES):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/atom+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Cache-Control": "no-cache",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = response.read()
+            break
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            status = getattr(exc, "code", None)
+            retryable = status in {429, 500, 502, 503, 504} or status is None
+            if not retryable or attempt == RSS_RETRIES - 1:
+                raise RuntimeError(f"RSS request failed: {exc}") from exc
+            retry_after = 0.0
+            try:
+                retry_after = float(exc.headers.get("Retry-After", "0"))
+            except (AttributeError, TypeError, ValueError):
+                pass
+            delay = min(RSS_BACKOFF_MAX_SECONDS, max(retry_after, 2.0 ** attempt))
+            log(
+                f"RSS HTTP {status or 'network'} for channel {channel_id}; "
+                f"retrying in {delay:.1f}s ({attempt + 1}/{RSS_RETRIES - 1})"
+            )
+            time.sleep(delay)
+
+    if payload is None:
+        raise RuntimeError(f"RSS request failed: {last_error or 'no response'}")
 
     try:
         root = ET.fromstring(payload)
@@ -298,6 +329,16 @@ def is_youtube_retryable_unavailable_error(error: Exception) -> bool:
         or "this content isn't available" in text
         or "requested format is not available" in text
     )
+
+
+def is_temporary_feed_error(error: Exception) -> bool:
+    """Return whether a channel feed failure should defer only that channel."""
+    text = str(error).casefold()
+    return any(marker in text for marker in (
+        "http error 429", "http error 500", "http error 502",
+        "http error 503", "http error 504", "timed out",
+        "temporary failure", "urlopen error",
+    ))
 
 
 def create_audio(video: dict, workdir: Path) -> Path:
@@ -590,9 +631,14 @@ def main() -> int:
         try:
             process_channel(state, channel_name, config)
         except Exception as exc:
-            failures.append(f"{channel_name}: {type(exc).__name__}: {exc}")
-            state["channels"].setdefault(channel_name, {})["status"] = f"ERROR: {type(exc).__name__}: {exc}"
-            log(f"{channel_name}: ERROR: {exc}")
+            channel_state = state["channels"].setdefault(channel_name, {})
+            if is_temporary_feed_error(exc):
+                channel_state["status"] = f"deferred temporary RSS outage: {exc}"
+                log(f"{channel_name}: WARNING deferred because the RSS feed was temporarily unavailable: {exc}")
+            else:
+                failures.append(f"{channel_name}: {type(exc).__name__}: {exc}")
+                channel_state["status"] = f"ERROR: {type(exc).__name__}: {exc}"
+                log(f"{channel_name}: ERROR: {exc}")
         if index < len(channel_items) - 1:
             random_pause("next channel check", CHANNEL_PAUSE_MIN, CHANNEL_PAUSE_MAX)
     save_state(state)

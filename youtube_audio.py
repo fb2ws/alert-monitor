@@ -282,10 +282,29 @@ def inspect_video(video: dict) -> dict:
         raise RuntimeError(f"metadata inspection timed out: {video['id']}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"metadata inspection failed for {video['id']}: {(result.stdout or '')[-1200:]}")
+    output = (result.stdout or "").strip()
     try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"yt-dlp returned invalid metadata for {video['id']}") from exc
+        metadata = json.loads(output)
+        if isinstance(metadata, dict):
+            return metadata
+    except json.JSONDecodeError:
+        pass
+
+    # yt-dlp normally emits one JSON object, but extractor diagnostics or a
+    # challenge response can precede/follow it even with --no-warnings. Find
+    # the first valid object instead of rejecting otherwise usable metadata.
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", output):
+        try:
+            candidate, _end = decoder.raw_decode(output[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and (candidate.get("id") or candidate.get("webpage_url")):
+            log(f"metadata parser recovered JSON after yt-dlp diagnostic output: {video['id']}")
+            return candidate
+
+    tail = output[-1200:] if output else "<empty output>"
+    raise RuntimeError(f"yt-dlp returned invalid metadata for {video['id']}: {tail}")
 
 
 def video_skip_reason(metadata: dict) -> str | None:
@@ -316,7 +335,8 @@ def is_youtube_temporary_error(error: Exception) -> bool:
     )
     scheduled_premiere = "premieres in" in text or "premiere in" in text
     no_player_response = "failed to extract any player response" in text
-    return bot_challenge or scheduled_premiere or no_player_response
+    invalid_metadata = "yt-dlp returned invalid metadata" in text
+    return bot_challenge or scheduled_premiere or no_player_response or invalid_metadata
 
 
 def is_youtube_retryable_unavailable_error(error: Exception) -> bool:

@@ -36,6 +36,8 @@ JETSO_MAX_SAVED_GUIDS = 200
 JETSO_ARTICLE_RETRIES = 3
 JETSO_ARTICLE_DELAY_SECONDS = 1.25
 JETSO_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+JETSO_MAX_ARTICLE_IMAGES = 20
+JETSO_MAX_TOTAL_IMAGE_BYTES = 15 * 1024 * 1024
 
 HKTVMALL_PRODUCT_URL = "https://www.hktvmall.com/hktv/zh/main/%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E5%AE%98%E6%96%B9%E6%97%97%E8%89%A6%E5%BA%97/s/H1108001/%E8%B6%85%E7%B4%9A%E5%B7%BF%E5%A0%B4/%E8%B6%85%E7%B4%9A%E5%B8%82%E5%A0%B4/%E9%A3%B2%E5%93%81-%E5%8D%B3%E6%B2%96%E9%A3%B2%E5%93%81/%E6%B1%BD%E6%B0%B4/%E5%8E%9F%E7%AE%B1-%E7%BD%90%E8%A3%9D%E5%8F%AF%E5%8F%A3%E5%8F%AF%E6%A8%82%E6%B1%BD%E6%B0%B4-%E6%96%B0%E8%88%8A%E5%8C%85%E8%A3%9D%E9%9A%A8%E6%A9%9F%E7%99%BC%E9%80%81/p/H0888001_S_P10021200"
 HKTVMALL_PRICE_LIMIT = 79.90
@@ -1029,7 +1031,7 @@ def parse_jetsoclub_feed(payload):
         alternate_links = []
         for child in list(element):
             child_name = child.tag.rsplit("}", 1)[-1].casefold()
-            if child_name in {"title", "guid", "id", "pubdate", "published", "updated"}:
+            if child_name in {"title", "guid", "id", "pubdate", "published", "updated", "description", "summary", "content"}:
                 values[child_name] = "".join(child.itertext()).strip()
             elif child_name == "link":
                 href = child.attrib.get("href", "").strip()
@@ -1046,8 +1048,9 @@ def parse_jetsoclub_feed(payload):
             link = "https://" + link[len("http://"):]
         guid = values.get("guid") or values.get("id") or link
         published = values.get("pubdate") or values.get("published") or values.get("updated") or ""
+        summary = clean_article_text(values.get("description") or values.get("summary") or values.get("content") or "")
         if title and link and guid:
-            items.append({"guid": guid, "title": title, "link": link, "published": published})
+            items.append({"guid": guid, "title": title, "link": link, "published": published, "summary": summary[:5000]})
     return items
 
 
@@ -1136,22 +1139,58 @@ def clean_jetsoclub_article_text(raw_text):
     return clean_article_text("\n".join(cleaned_lines))
 
 
+def extract_jetsoclub_post_body(raw_html):
+    """Isolate Blogger's post body despite imperfect markup elsewhere on the page."""
+    start_pattern = re.compile(
+        r"<div\b[^>]*(?:class\s*=\s*['\"][^'\"]*\bpost-body\b[^'\"]*['\"]|"
+        r"itemprop\s*=\s*['\"][^'\"]*\barticleBody\b[^'\"]*['\"])[^>]*>",
+        re.IGNORECASE,
+    )
+    start_match = start_pattern.search(raw_html)
+    if not start_match:
+        return raw_html
+
+    div_pattern = re.compile(r"</?div\b[^>]*>", re.IGNORECASE)
+    depth = 1
+    for tag_match in div_pattern.finditer(raw_html, start_match.end()):
+        tag = tag_match.group(0)
+        if tag.startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return raw_html[start_match.start():tag_match.end()]
+        elif not tag.rstrip().endswith("/>"):
+            depth += 1
+    return raw_html[start_match.start():]
+
+
 def fetch_jetsoclub_article_content(item):
-    """Fetch readable post-body text and the first post-body image URL."""
+    """Fetch readable post-body text and all relevant post-body image URLs."""
     status, _headers, payload = fetch_jetsoclub_url(
         item["link"],
         {"Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "Referer": "https://www.jetsoclub.com/"},
     )
     if status != 200:
         raise RuntimeError(f"article HTTP status {status}")
+    html_payload = payload.decode("utf-8", errors="replace")
     parser = JetsoArticleTextParser()
-    parser.feed(payload.decode("utf-8", errors="replace"))
+    parser.feed(extract_jetsoclub_post_body(html_payload))
     parser.close()
     text = clean_jetsoclub_article_text("".join(parser.parts))
-    if not text:
+    image_urls = []
+    for source in parser.image_urls:
+        absolute_url = urljoin(item["link"], source)
+        if absolute_url not in image_urls:
+            image_urls.append(absolute_url)
+        if len(image_urls) >= JETSO_MAX_ARTICLE_IMAGES:
+            break
+    if not text and not image_urls and not item.get("summary"):
         raise RuntimeError("JetsoClub post-body text was empty")
-    image_url = urljoin(item["link"], parser.image_urls[0]) if parser.image_urls else ""
-    return {"text": text[:5000], "image_url": image_url}
+    fallback_text = "本文主要以圖片提供內容，請查看下方圖片。" if image_urls else ""
+    return {
+        "text": (text or item.get("summary") or fallback_text)[:5000],
+        "image_url": image_urls[0] if image_urls else "",
+        "image_urls": image_urls,
+    }
 
 
 def fetch_jetsoclub_article_text(item):
@@ -1188,8 +1227,8 @@ def build_jetsoclub_html_email(items, article_contents, image_cids=None):
             f'<h3>{index}. {escape(item["title"])}</h3>',
             f'<div>{paragraphs}</div>',
         ])
-        cid = image_cids.get(item["guid"])
-        if cid:
+        cids = image_cids.get(item["guid"], [])
+        for cid in cids:
             sections.append(f'<p style="text-align:center"><img src="cid:{escape(cid)}" alt="{escape(item["title"])}" style="display:block;max-width:100%;height:auto;margin:12px auto"></p>')
         sections.extend([
             f'<p><a href="{escape(item["link"], quote=True)}" target="_blank" rel="noopener noreferrer">查看文章</a></p>',
@@ -1297,6 +1336,7 @@ def check_jetsoclub(state):
     article_texts = {}
     inline_images = []
     image_cids = {}
+    total_image_bytes = 0
     for index, item in enumerate(batch):
         try:
             if index:
@@ -1304,14 +1344,28 @@ def check_jetsoclub(state):
             content = fetch_jetsoclub_article_content(item)
             article_contents[item["guid"]] = content
             article_texts[item["guid"]] = content["text"]
-            image_result = download_jetsoclub_inline_image(content.get("image_url", ""))
-            if image_result:
-                image_data, image_subtype = image_result
-                cid = "jetso-" + hashlib.sha256(item["guid"].encode("utf-8")).hexdigest()[:16]
-                image_cids[item["guid"]] = cid
-                inline_images.append((cid, image_data, image_subtype))
         except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as exc:
             log_event(state, "JETSOCLUB", f"Article text fetch failed for {item['link']}; title/link retained ({str(exc)[:120]})")
+            fallback_text = item.get("summary", "")
+            article_texts[item["guid"]] = fallback_text
+            article_contents[item["guid"]] = {"text": fallback_text, "image_urls": []}
+            continue
+
+        for image_index, image_url in enumerate(content.get("image_urls", []), start=1):
+            try:
+                image_result = download_jetsoclub_inline_image(image_url)
+                if not image_result:
+                    continue
+                image_data, image_subtype = image_result
+                if total_image_bytes + len(image_data) > JETSO_MAX_TOTAL_IMAGE_BYTES:
+                    log_event(state, "JETSOCLUB", f"Inline image budget reached; skipped image {image_index} for {item['link']}")
+                    break
+                cid = "jetso-" + hashlib.sha256(f"{item['guid']}:{image_url}".encode("utf-8")).hexdigest()[:16]
+                image_cids.setdefault(item["guid"], []).append(cid)
+                inline_images.append((cid, image_data, image_subtype))
+                total_image_bytes += len(image_data)
+            except (HTTPError, URLError, TimeoutError, OSError, RuntimeError) as exc:
+                log_event(state, "JETSOCLUB", f"Inline image fetch failed for {image_url}; remaining images continue ({str(exc)[:120]})")
 
     success = send_html_email(
         "JetsoClub 最新情報",
